@@ -1,0 +1,16 @@
+/target
+.DS_Store
+# Build products of ios/build-core.sh and xcodegen
+ios/AuroraCore.xcframework
+ios/Aurora.xcodeproj
+ios/build/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+# Never commit ring auth keys or local databases
+*.key
+*.db
+*.db-wal
+*.db-shm
+ios/Generated/
+ios/Aurora/Resources/Info.plist

@@ -1,0 +1,36 @@
+[package]
+name = "aurora-core"
+description = "Rust core of the Aurora iOS app: Oura ring session, local store and metric normalisation, exposed to Swift via UniFFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "aurora_core"
+# staticlib for the iOS xcframework, cdylib for UniFFI library-mode bindgen, lib for tests.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+# Protocol reference: https://github.com/Th0rgal/open_oura (MIT). Pinned by rev so a
+# protocol change upstream never silently changes what the app sends to the ring.
+oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "e57c43ce5fe0cf9a646afa790bda3731be767507" }
+oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "e57c43ce5fe0cf9a646afa790bda3731be767507" }
+oura-analysis = { git = "https://github.com/Th0rgal/open_oura", rev = "e57c43ce5fe0cf9a646afa790bda3731be767507" }
+# The ring client + Transport trait WITHOUT btleplug: iOS supplies CoreBluetooth.
+oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "e57c43ce5fe0cf9a646afa790bda3731be767507", default-features = false }
+uniffi = { version = "0.28", features = ["cli", "tokio"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+async-trait = "0.1"
+getrandom = "0.2"
+thiserror = "1"
+serde_json = "1"
+hex = "0.4"
+# Same version oura-store links, so there is exactly one SQLite in the binary.
+rusqlite = "0.31"
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
