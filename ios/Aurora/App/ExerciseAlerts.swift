@@ -22,7 +22,7 @@ final class ExerciseAlerts {
         static let endNotice = "exercise.endNotice"
         static let inExercise = "exercise.state.active"
         static let lastAlert = "exercise.state.lastAlert"
-        static let quiet = "exercise.state.calmSince"
+        static let quiet = "exercise.state.quietChecks"
     }
 
     static let windowMinutes: UInt32 = 8
@@ -36,18 +36,9 @@ final class ExerciseAlerts {
     var minutesNeeded: Int { defaults.object(forKey: Key.minutes) as? Int ?? 5 }
     var endNotice: Bool { defaults.object(forKey: Key.endNotice) as? Bool ?? true }
 
-    /// The watch drives the reminder while it is sending heart rate.
-    weak var watch: HeartRateMonitor?
-    /// Called with a line for the sync history when the watch starts or ends an exercise.
-    var onWatchDecision: ((String) -> Void)?
-    private var lastWatchCheck = Date.distantPast
-
     /// Evaluate after a sync. Returns a one-line decision for the sync history.
     func evaluate(store: AuroraStore, report: SyncReport) -> String? {
         guard isEnabled else { return nil }
-        if let watch, watch.isLive {
-            return "Exercise: following watch heart rate (\(watch.latestBPM ?? 0) bpm now)"
-        }
         let check: ExerciseCheck
         do {
             check = try store.exerciseCheck(now: Date.now.timeIntervalSince1970,
@@ -60,63 +51,48 @@ final class ExerciseAlerts {
         let ringWorkout = report.exerciseMeasuring && Double(report.exerciseHeartRate ?? 0) >= heartRateThreshold
         let active = Int(check.activeMinutes) >= minutesNeeded || ringWorkout
 
-        var line = "Exercise (ring): \(check.activeMinutes)/\(check.windowMinutes) active min"
+        var line = "Exercise: \(check.activeMinutes)/\(check.windowMinutes) active min"
         if let hr = check.maxHeartRate { line += ", max HR \(Int(hr))" }
         if let bpm = report.exerciseHeartRate { line += ", ring workout HR \(bpm)" }
         if let newest = check.newestDataTs {
             let lag = Int((Date.now.timeIntervalSince1970 - newest) / 60)
             if lag >= 3 { line += ", data \(lag) min old" }
         }
-        return line + " → " + decide(active: active)
-    }
 
-    /// Watch path: called for every watch reading, evaluated at most every 20 s.
-    /// Minutes are active when the watch's median heart rate that minute reaches the
-    /// threshold (movement isn't available from the watch broadcast).
-    func watchReading() {
-        guard isEnabled, let watch, Date.now.timeIntervalSince(lastWatchCheck) >= 20 else { return }
-        lastWatchCheck = .now
-        let medians = watch.minuteMedians(Int(Self.windowMinutes))
-        let activeCount = medians.compactMap { $0 }.filter { $0 >= heartRateThreshold }.count
-        let wasIn = defaults.bool(forKey: Key.inExercise)
-        let decision = decide(active: activeCount >= minutesNeeded)
-        if defaults.bool(forKey: Key.inExercise) != wasIn {
-            let maxHR = medians.compactMap { $0 }.max().map { ", max HR \(Int($0))" } ?? ""
-            onWatchDecision?("Exercise (watch): \(activeCount)/\(Self.windowMinutes) active min\(maxHR) → \(decision)")
-        }
-    }
-
-    /// The start/end state machine shared by the ring and watch paths.
-    private func decide(active: Bool) -> String {
         let inExercise = defaults.bool(forKey: Key.inExercise)
         if active {
-            defaults.removeObject(forKey: Key.quiet)
-            guard !inExercise else { return "still exercising" }
-            defaults.set(true, forKey: Key.inExercise)
-            let last = defaults.object(forKey: Key.lastAlert) as? Date ?? .distantPast
-            guard Date.now.timeIntervalSince(last) >= Self.cooldown else {
-                return "started (reminder skipped, one was sent recently)"
+            defaults.set(0, forKey: Key.quiet)
+            if !inExercise {
+                defaults.set(true, forKey: Key.inExercise)
+                let last = defaults.object(forKey: Key.lastAlert) as? Date ?? .distantPast
+                if Date.now.timeIntervalSince(last) >= Self.cooldown {
+                    defaults.set(Date.now, forKey: Key.lastAlert)
+                    Self.notify(title: "Exercise detected",
+                                body: "Your heart rate has been up for a few minutes. Set a temp target in Trio?",
+                                id: "exercise.start")
+                    return line + " → started, reminder sent"
+                }
+                return line + " → started (reminder skipped, one was sent recently)"
             }
-            defaults.set(Date.now, forKey: Key.lastAlert)
-            Self.notify(title: "Exercise detected",
-                        body: "Your heart rate has been up for a few minutes. Set a temp target in Trio?",
-                        id: "exercise.start")
-            return "started, reminder sent"
+            return line + " → still exercising"
         }
-        guard inExercise else { return "no exercise" }
-        // Ends after about 10 calm minutes.
-        let calmSince = defaults.object(forKey: Key.quiet) as? Date ?? {
-            defaults.set(Date.now, forKey: Key.quiet)
-            return Date.now
-        }()
-        guard Date.now.timeIntervalSince(calmSince) >= 9 * 60 else { return "calming down" }
-        defaults.set(false, forKey: Key.inExercise)
-        defaults.removeObject(forKey: Key.quiet)
-        guard endNotice else { return "ended" }
-        Self.notify(title: "Exercise ended",
-                    body: "Things have been calm for about 10 minutes. Time to end the temp target in Trio?",
-                    id: "exercise.end")
-        return "ended, notice sent"
+        if inExercise {
+            let quiet = defaults.integer(forKey: Key.quiet) + 1
+            defaults.set(quiet, forKey: Key.quiet)
+            if quiet >= 2 { // about 10 minutes calm
+                defaults.set(false, forKey: Key.inExercise)
+                defaults.set(0, forKey: Key.quiet)
+                if endNotice {
+                    Self.notify(title: "Exercise ended",
+                                body: "Things have calmed down for about 10 minutes. Time to end the temp target in Trio?",
+                                id: "exercise.end")
+                    return line + " → ended, notice sent"
+                }
+                return line + " → ended"
+            }
+            return line + " → calming down"
+        }
+        return line + " → no exercise"
     }
 
     static func requestPermission() async -> Bool {

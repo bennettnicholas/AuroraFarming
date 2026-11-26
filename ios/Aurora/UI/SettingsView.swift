@@ -55,7 +55,6 @@ struct SettingsView: View {
                         LabeledContent("Active minutes needed", value: "\(exerciseMinutes) of last 8")
                     }
                     Toggle("Also tell me when it ends", isOn: $exerciseEndNotice)
-                    NavigationLink("Heart-rate watch") { WatchSetupView() }
                     Button("Send a test notification") { ExerciseAlerts.sendTest() }
                 }
             } header: {

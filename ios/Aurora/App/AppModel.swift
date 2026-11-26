@@ -29,7 +29,6 @@ final class AppModel {
     let connectors: ConnectorManager
     let history = SyncHistory()
     let exercise = ExerciseAlerts()
-    let watch = HeartRateMonitor()
     private let ble = RingBluetooth()
     private let log = Logger(subsystem: "Aurora", category: "App")
 
@@ -73,13 +72,6 @@ final class AppModel {
         connectors = ConnectorManager(store: store)
         device = try? store.device()
         ble.onStateChange = { [weak self] state in self?.linkState = state }
-        exercise.watch = watch
-        exercise.onWatchDecision = { [weak self] line in
-            self?.history.add(SyncRecord(date: .now, trigger: .watch, ok: true, detail: "Watch heart rate",
-                                         nocturne: nil, wasInBackground: self?.isBackground ?? false,
-                                         exercise: line))
-        }
-        watch.onReading = { [weak self] _, _ in self?.exercise.watchReading() }
         ble.onUnsolicitedConnect = { [weak self] in
             Task { await self?.handleScheduledWake() }
         }
