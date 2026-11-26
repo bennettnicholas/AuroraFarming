@@ -65,8 +65,7 @@ private struct ConnectorRow: View {
                 }
                 Text(connector.tagline).font(.caption).foregroundStyle(.secondary)
                 if let status {
-                    Text(status.error.map { "Error: \($0)" }
-                         ?? "Sent \(status.exported) readings \(agoText(status.lastRun))")
+                    Text(status.error.map { "Error: \($0)" } ?? statusLine(status))
                         .font(.caption2)
                         .foregroundStyle(status.error == nil ? Color.secondary : Theme.amber)
                 }
@@ -132,4 +131,18 @@ struct NocturneSettingsView: View {
         .background(AuroraBackground())
         .navigationTitle("Nocturne")
     }
+}
+
+/// "Checked just now, nothing new · last sent 12 readings 4 min ago (newest 9:41 PM)".
+private func statusLine(_ status: ConnectorStatus) -> String {
+    var line = status.exported > 0
+        ? "Sent \(status.exported) readings \(agoText(status.lastRun))"
+        : "Checked \(agoText(status.lastRun)), nothing new"
+    if status.exported == 0, let at = status.lastSentAt, let n = status.lastSentCount {
+        line += " · last sent \(n) \(agoText(at))"
+    }
+    if let newest = status.newestSentReading {
+        line += " · newest reading sent: \(newest.formatted(date: .omitted, time: .shortened))"
+    }
+    return line
 }

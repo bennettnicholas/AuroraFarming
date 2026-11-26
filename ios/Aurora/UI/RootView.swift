@@ -27,7 +27,7 @@ struct SyncPill: View {
 
     var body: some View {
         Button {
-            Task { await model.syncNow() }
+            Task { await model.syncNow(trigger: .manual) }
         } label: {
             HStack(spacing: 8) {
                 if model.syncPhase.isBusy {

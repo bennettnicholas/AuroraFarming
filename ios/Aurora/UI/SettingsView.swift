@@ -17,6 +17,7 @@ struct SettingsView: View {
                 Toggle("Sync every 5 minutes", isOn: Binding(
                     get: { model.continuousSync },
                     set: { model.continuousSync = $0 }))
+                NavigationLink("Sync history") { SyncHistoryView() }
             } header: {
                 Text("Sync")
             } footer: {

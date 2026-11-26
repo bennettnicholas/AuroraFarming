@@ -66,6 +66,8 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
     private var sessionReadyAt: Date?
     /// A delayed connect is armed and has not produced a ready session yet.
     private var wakePending = false
+    /// We dropped the link ourselves to arm a wake; its didDisconnect must not re-arm.
+    private var droppingForWake = false
 
     /// Called on the main actor whenever the link state changes.
     var onStateChange: (@MainActor (State) -> Void)?
@@ -104,6 +106,7 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
             guard let id = self.rememberedPeripheral,
                   let p = self.central.retrievePeripherals(withIdentifiers: [id]).first else { return }
             if let current = self.peripheral, current.state != .disconnected {
+                self.droppingForWake = current.identifier == p.identifier
                 self.central.cancelPeripheralConnection(current)
             }
             self.reset()
@@ -397,6 +400,14 @@ extension RingBluetooth: CBCentralManagerDelegate {
         diag.add("didDisconnect \(peripheral.identifier.uuidString): \(error?.localizedDescription ?? "-")")
         // Ignore links we already abandoned (e.g. the losing side of the scan race).
         guard peripheral.identifier == self.peripheral?.identifier else { return }
+        if droppingForWake && connectContinuation == nil {
+            // Our own cancel before arming the 5-minute wake. Re-arming here used to
+            // replace the 5-minute delay with 30 s, making the cadence erratic.
+            droppingForWake = false
+            diag.add("link dropped for the scheduled wake")
+            return
+        }
+        droppingForWake = false
         if connectContinuation != nil {
             fail(BLEError.disconnected(error?.localizedDescription))
         } else if wakePending {

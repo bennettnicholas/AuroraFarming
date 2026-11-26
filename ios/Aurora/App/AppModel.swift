@@ -27,6 +27,7 @@ final class AppModel {
 
     let store: AuroraStore
     let connectors: ConnectorManager
+    let history = SyncHistory()
     private let ble = RingBluetooth()
     private let log = Logger(subsystem: "Aurora", category: "App")
 
@@ -104,11 +105,15 @@ final class AppModel {
     // MARK: - Sync
 
     /// Sync if the last one is older than `minimumInterval`.
-    func syncIfStale(minimumInterval: TimeInterval = 15 * 60) async {
+    func syncIfStale(minimumInterval: TimeInterval = 15 * 60, trigger: SyncTrigger) async {
         guard hasKey, !syncPhase.isBusy else { return }
         if let last = lastSync, Date.now.timeIntervalSince(last) < minimumInterval { return }
-        await syncNow(userInitiated: false)
+        await syncNow(userInitiated: false, trigger: trigger)
     }
+
+    /// True while iOS has Aurora in the background, including a background relaunch
+    /// (where no scene-phase change ever arrives).
+    private var isBackground: Bool { UIApplication.shared.applicationState == .background }
 
     /// Sync with the ring, retrying link failures.
     ///
@@ -117,11 +122,12 @@ final class AppModel {
     /// the stored cursor makes a retried download resume, not restart. Automatic
     /// (launch / background) syncs that cannot reach the ring fail quietly: the ring
     /// is simply not nearby.
-    func syncNow(userInitiated: Bool = true) async {
+    func syncNow(userInitiated: Bool = true, trigger: SyncTrigger = .manual) async {
         guard let key = Keychain.get(Keychain.ringKeyAccount), !syncPhase.isBusy else { return }
-        // If the app went to the background mid-sync, the next wake is scheduled here,
-        // once the link is free (scheduling it drops the current connection).
-        defer { if !isInForeground && continuousSync && hasKey { scheduleNextWake() } }
+        // If the app is in the background (or went there mid-sync), the next wake is
+        // scheduled here, once the link is free (scheduling it drops the connection).
+        defer { if isBackground && continuousSync && hasKey { scheduleNextWake() } }
+        let background = isBackground
         let maxAttempts = userInitiated ? 3 : 2
         var lastError: Error?
         for attempt in 1...maxAttempts {
@@ -131,7 +137,10 @@ final class AppModel {
             }
             syncPhase = .connecting
             do {
-                try await syncOnce(key: key)
+                let newEvents = try await syncOnce(key: key)
+                history.add(SyncRecord(date: .now, trigger: trigger, ok: true,
+                                       detail: newEvents == 1 ? "1 new event" : "\(newEvents) new events",
+                                       nocturne: nocturneResult(), wasInBackground: background))
                 return
             } catch {
                 lastError = error
@@ -141,6 +150,8 @@ final class AppModel {
             }
         }
         let message = lastError.map(userMessage(for:)) ?? "Sync failed."
+        history.add(SyncRecord(date: .now, trigger: trigger, ok: false, detail: message,
+                               nocturne: nil, wasInBackground: background))
         if !userInitiated, let lastError, Self.isRetryable(lastError) {
             syncPhase = .idle // ring out of range: not worth an alarm
         } else {
@@ -163,7 +174,16 @@ final class AppModel {
         return error is CancellationError ? false : true
     }
 
-    private func syncOnce(key: String) async throws {
+    /// Nocturne's outcome from the export that just ran, nil when it's off.
+    private func nocturneResult() -> String? {
+        guard let c = connectors.connector(id: "nocturne"), c.isEnabled, c.isConfigured,
+              let st = connectors.statuses["nocturne"], Date.now.timeIntervalSince(st.lastRun) < 120 else { return nil }
+        if let error = st.error { return "Nocturne failed: \(error)" }
+        return st.exported == 0 ? "Nocturne: nothing new" : "Nocturne: sent \(st.exported)"
+    }
+
+    @discardableResult
+    private func syncOnce(key: String) async throws -> UInt32 {
         DiagnosticsLog.shared.add("sync: connecting")
         let session = try await ble.connect()
         if ringInfo == nil { ringInfo = try? await session.info() }
@@ -187,6 +207,7 @@ final class AppModel {
         syncPhase = .finished(report)
         DiagnosticsLog.shared.add("sync ok: \(report.eventsReceived) events, \(report.newEvents) new, warnings \(report.warnings)")
         await connectors.exportAll()
+        return report.newEvents
     }
 
     // MARK: - Continuous (5-minute) sync
@@ -197,7 +218,7 @@ final class AppModel {
     var continuousSync: Bool = UserDefaults.standard.object(forKey: "sync.continuous") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(continuousSync, forKey: "sync.continuous")
-            if continuousSync { scheduleNextWake() } else { ble.cancelWake() }
+            if continuousSync { scheduleNextWake() } else { ble.cancelWake(); history.setNextWake(nil) }
         }
     }
 
@@ -220,15 +241,17 @@ final class AppModel {
         foregroundTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.continuousSync, !self.isStreamingHeartRate else { return }
-                await self.syncIfStale(minimumInterval: Self.continuousInterval - 15)
+                await self.syncIfStale(minimumInterval: Self.continuousInterval - 15, trigger: .foregroundTimer)
             }
         }
-        Task { await syncIfStale(minimumInterval: continuousSync ? Self.continuousInterval - 15 : 15 * 60) }
+        Task { await syncIfStale(minimumInterval: continuousSync ? Self.continuousInterval - 15 : 15 * 60, trigger: .appOpen) }
     }
 
-    private func scheduleNextWake() {
+    func scheduleNextWake() {
         let since = lastSync.map { Date.now.timeIntervalSince($0) } ?? Self.continuousInterval
-        ble.scheduleWake(after: max(5, Self.continuousInterval - since))
+        let delay = max(5, Self.continuousInterval - since)
+        ble.scheduleWake(after: delay)
+        history.setNextWake(Date.now.addingTimeInterval(delay))
     }
 
     /// The delayed connection fired: sync, then schedule the next one. iOS gives a
@@ -237,7 +260,9 @@ final class AppModel {
         let task = UIApplication.shared.beginBackgroundTask(withName: "aurora.sync")
         defer { if task != .invalid { UIApplication.shared.endBackgroundTask(task) } }
         DiagnosticsLog.shared.add("scheduled wake: syncing (foreground=\(isInForeground))")
-        await syncNow(userInitiated: false) // schedules the next wake when done
+        await syncNow(userInitiated: false, trigger: .backgroundWake) // schedules the next wake when done
+        // syncNow returns early (no reschedule) if another sync was running.
+        if isBackground && continuousSync && hasKey && !syncPhase.isBusy { scheduleNextWake() }
     }
 
     // MARK: - Pairing
@@ -304,6 +329,7 @@ final class AppModel {
 
     func forgetRing() {
         ble.cancelWake()
+        history.setNextWake(nil)
         Keychain.delete(Keychain.ringKeyAccount)
         hasKey = false
         ringInfo = nil
@@ -451,7 +477,10 @@ final class AppModel {
         BGTaskScheduler.shared.register(forTaskWithIdentifier: backgroundSyncTask, using: nil) { task in
             scheduleBackgroundSync()
             let work = Task { @MainActor in
-                await model().syncIfStale(minimumInterval: 30 * 60)
+                let m = model()
+                await m.syncIfStale(minimumInterval: 30 * 60, trigger: .backgroundRefresh)
+                // Re-arm the 5-minute chain in case iOS dropped it (e.g. after a reboot).
+                if m.continuousSync && m.hasKey && !m.syncPhase.isBusy { m.scheduleNextWake() }
                 task.setTaskCompleted(success: true)
             }
             task.expirationHandler = { work.cancel() }

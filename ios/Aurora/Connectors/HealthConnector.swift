@@ -40,6 +40,11 @@ struct ConnectorStatus: Codable, Equatable {
     var lastRun: Date
     var exported: Int
     var error: String?
+    /// The last run that actually sent something, and the newest reading it sent.
+    /// A run with nothing new keeps these, so "sent 0" doesn't hide recent uploads.
+    var lastSentAt: Date?
+    var lastSentCount: Int?
+    var newestSentReading: Date?
 }
 
 @MainActor
@@ -83,12 +88,14 @@ final class ConnectorManager {
     private func export(_ c: any HealthConnector) async {
         var exported = 0
         var errorText: String?
+        var newest: Double?
         do {
             var cursor = try store.connectorCursor(connectorId: c.id)
             while true {
                 let page = try store.samplesAfter(afterId: cursor, kinds: c.exportedKinds, limit: pageSize)
                 guard let last = page.last else { break }
                 try await c.upload(page)
+                newest = max(newest ?? 0, page.map(\.ts).max() ?? 0)
                 cursor = last.id
                 try store.setConnectorCursor(connectorId: c.id, cursor: cursor)
                 exported += page.count
@@ -97,7 +104,16 @@ final class ConnectorManager {
         } catch {
             errorText = userMessage(for: error)
         }
-        statuses[c.id] = ConnectorStatus(lastRun: .now, exported: exported, error: errorText)
+        var status = statuses[c.id] ?? ConnectorStatus(lastRun: .now, exported: 0)
+        status.lastRun = .now
+        status.exported = exported
+        status.error = errorText
+        if exported > 0 {
+            status.lastSentAt = .now
+            status.lastSentCount = exported
+            if let newest { status.newestSentReading = Date(timeIntervalSince1970: newest) }
+        }
+        statuses[c.id] = status
         if let data = try? JSONEncoder().encode(statuses) {
             UserDefaults.standard.set(data, forKey: "aurora.connector.statuses")
         }

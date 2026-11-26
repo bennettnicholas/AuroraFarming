@@ -25,7 +25,7 @@ struct TodayView: View {
                 .padding(.horizontal)
                 .padding(.bottom, 32)
             }
-            .refreshable { await model.syncNow() }
+            .refreshable { await model.syncNow(trigger: .manual) }
             .auroraScreen()
             .toolbar(.hidden, for: .navigationBar)
         }
