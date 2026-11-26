@@ -95,7 +95,7 @@ final class ConnectorManager {
                 if page.count < pageSize { break }
             }
         } catch {
-            errorText = error.localizedDescription
+            errorText = userMessage(for: error)
         }
         statuses[c.id] = ConnectorStatus(lastRun: .now, exported: exported, error: errorText)
         if let data = try? JSONEncoder().encode(statuses) {

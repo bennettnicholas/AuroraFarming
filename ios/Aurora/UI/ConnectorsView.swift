@@ -111,7 +111,7 @@ struct NocturneSettingsView: View {
                 Button {
                     testing = true
                     Task {
-                        do { testResult = try await connector.testConnection() } catch { testResult = error.localizedDescription }
+                        do { testResult = try await connector.testConnection() } catch { testResult = userMessage(for: error) }
                         testing = false
                     }
                 } label: {

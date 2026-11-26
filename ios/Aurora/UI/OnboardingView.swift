@@ -164,7 +164,7 @@ struct OnboardingView: View {
         busy = true
         message = nil
         Task {
-            do { try await work() } catch { message = error.localizedDescription }
+            do { try await work() } catch { message = userMessage(for: error) }
             busy = false
         }
     }

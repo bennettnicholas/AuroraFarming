@@ -40,10 +40,10 @@ struct SettingsView: View {
                         let n = try model.rebuildSamples()
                         notice = "Updated \(n) readings."
                         load()
-                    } catch { notice = error.localizedDescription }
+                    } catch { notice = userMessage(for: error) }
                 }
                 Button("Export database") {
-                    do { exportURL = try model.exportDatabase() } catch { notice = error.localizedDescription }
+                    do { exportURL = try model.exportDatabase() } catch { notice = userMessage(for: error) }
                 }
                 if let exportURL {
                     ShareLink(item: exportURL) { Label("Share \(exportURL.lastPathComponent)", systemImage: "square.and.arrow.up") }

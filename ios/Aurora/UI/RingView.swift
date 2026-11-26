@@ -138,7 +138,7 @@ struct RingView: View {
                 HStack {
                     Button("Check") {
                         Task {
-                            do { features = try await model.features() } catch { notice = error.localizedDescription }
+                            do { features = try await model.features() } catch { notice = userMessage(for: error) }
                         }
                     }
                     .buttonStyle(.bordered)
@@ -148,7 +148,7 @@ struct RingView: View {
                                 let warnings = try await model.enableMeasurements()
                                 notice = warnings.isEmpty ? "Automatic heart rate and SpO2 are on." : warnings.joined(separator: "\n")
                                 features = try await model.features()
-                            } catch { notice = error.localizedDescription }
+                            } catch { notice = userMessage(for: error) }
                         }
                     }
                     .buttonStyle(.bordered)

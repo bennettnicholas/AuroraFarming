@@ -134,12 +134,12 @@ final class AppModel {
                 return
             } catch {
                 lastError = error
-                DiagnosticsLog.shared.add("sync attempt \(attempt) failed: \(error.localizedDescription)")
+                DiagnosticsLog.shared.add("sync attempt \(attempt) failed: \(userMessage(for: error))")
                 log.error("sync attempt \(attempt) failed: \(error.localizedDescription, privacy: .public)")
                 if !Self.isRetryable(error) { break }
             }
         }
-        let message = lastError?.localizedDescription ?? "Sync failed."
+        let message = lastError.map(userMessage(for:)) ?? "Sync failed."
         if !userInitiated, let lastError, Self.isRetryable(lastError) {
             syncPhase = .idle // ring out of range: not worth an alarm
         } else {
@@ -385,7 +385,7 @@ final class AppModel {
         } catch {
             DiagnosticsLog.shared.add("live HR failed: \(error.localizedDescription)")
             log.error("live HR: \(error.localizedDescription, privacy: .public)")
-            liveError = error.localizedDescription
+            liveError = userMessage(for: error)
         }
     }
 

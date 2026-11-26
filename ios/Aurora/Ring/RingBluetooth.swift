@@ -58,6 +58,10 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
 
     private var poweredOnWaiters: [CheckedContinuation<Void, Error>] = []
     private var connectContinuation: CheckedContinuation<RingSession, Error>?
+    /// Callers that asked to connect while a connect was already in progress. They
+    /// share its outcome instead of cancelling it (two Ring-tab cards loading at once
+    /// used to cancel each other).
+    private var extraWaiters: [CheckedContinuation<RingSession, Error>] = []
     /// When the current session became ready; a fresh one (from a scheduled wake) is reused.
     private var sessionReadyAt: Date?
     /// A delayed connect is armed and has not produced a ready session yet.
@@ -196,8 +200,10 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
     }
 
     private func beginConnect(_ cont: CheckedContinuation<RingSession, Error>) {
-        if let previous = connectContinuation {
-            previous.resume(throwing: CancellationError())
+        if connectContinuation != nil {
+            diag.add("connect: joining the connect in progress")
+            extraWaiters.append(cont)
+            return
         }
         connectContinuation = cont
         // A scheduled wake just brought the ring up: use that link instead of tearing it down.
@@ -266,6 +272,9 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
         state = .idle
         connectContinuation?.resume(throwing: error)
         connectContinuation = nil
+        let waiters = extraWaiters
+        extraWaiters = []
+        waiters.forEach { $0.resume(throwing: error) }
     }
 
     private func finishIfReady() {
@@ -283,6 +292,9 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
         if let cont = connectContinuation {
             cont.resume(returning: s)
             connectContinuation = nil
+            let waiters = extraWaiters
+            extraWaiters = []
+            waiters.forEach { $0.resume(returning: s) }
         } else if let cb = onUnsolicitedConnect {
             diag.add("scheduled wake: ring connected")
             Task { @MainActor in cb() }
