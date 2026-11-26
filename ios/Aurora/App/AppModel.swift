@@ -37,6 +37,7 @@ final class AppModel {
     private(set) var ringInfo: RingInfo?
     private(set) var battery: BatteryStatus?
     private(set) var liveHeartRate: UInt16?
+    @ObservationIgnored private var liveSmoother = HeartRateSmoother()
     private(set) var isStreamingHeartRate = false
     /// Bumped after every sync so views reload their queries.
     private(set) var dataVersion = 0
@@ -354,9 +355,18 @@ final class AppModel {
             let session = try await connectWithRetry()
             liveSession = session
             liveStatus = "Waiting for beats. Keep the ring snug and your hand still."
-            let listener = LiveHeartRate { [weak self] bpm, live in
+            liveSmoother.reset()
+            let listener = LiveHeartRate { [weak self] bpm, ibiMs in
                 guard let self, self.isStreamingHeartRate else { return }
-                self.liveHeartRate = bpm
+                let live = ibiMs > 0
+                if live {
+                    // Show a 5 s average, not each beat: beat-to-beat bpm swings
+                    // with breathing. Until a few beats are in, show the raw beat.
+                    self.liveHeartRate = self.liveSmoother.add(ibiMs: ibiMs, at: Date.now.timeIntervalSinceReferenceDate)
+                        ?? self.liveHeartRate ?? bpm
+                } else {
+                    self.liveHeartRate = bpm
+                }
                 self.liveIsFallback = !live
                 self.liveStatus = live ? nil : "Latest automatic reading. Live beats haven't arrived yet."
             }
@@ -481,10 +491,10 @@ private final class SyncProgress: SyncListener, @unchecked Sendable {
 }
 
 private final class LiveHeartRate: HeartRateListener, @unchecked Sendable {
-    /// `(bpm, isLiveBeat)`; a reading with `ibiMs == 0` is the ring's latest automatic value.
-    private let update: @MainActor (UInt16, Bool) -> Void
-    init(update: @escaping @MainActor (UInt16, Bool) -> Void) { self.update = update }
+    /// `(bpm, ibiMs)`; a reading with `ibiMs == 0` is the ring's latest automatic value.
+    private let update: @MainActor (UInt16, UInt16) -> Void
+    init(update: @escaping @MainActor (UInt16, UInt16) -> Void) { self.update = update }
     func onHeartRate(bpm: UInt16, ibiMs: UInt16) {
-        Task { @MainActor in update(bpm, ibiMs > 0) }
+        Task { @MainActor in update(bpm, ibiMs) }
     }
 }

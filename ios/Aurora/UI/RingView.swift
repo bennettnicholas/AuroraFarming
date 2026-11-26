@@ -78,7 +78,7 @@ struct RingView: View {
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: 4) {
                         SectionHeader(title: "Live heart rate", symbol: "heart.fill")
-                        Text("Beat-to-beat heart rate for up to two minutes. Wear the ring.")
+                        Text("Heart rate averaged over 5 seconds, for up to two minutes. Wear the ring.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
