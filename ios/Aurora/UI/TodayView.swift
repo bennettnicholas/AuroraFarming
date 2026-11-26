@@ -197,8 +197,8 @@ private struct HeartRateDayCard: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                BucketChart(kind: .heartRate, buckets: model.buckets(.heartRate, from: start, to: end, bucket: 1800),
-                            bucketSeconds: 1800)
+                // Every reading of the day; drag across the chart to read one.
+                SampleChart(kind: .heartRate, samples: model.samples(.heartRate, from: start, to: end))
             }
         }
     }

@@ -179,3 +179,88 @@ extension Double {
         return "\(total / 60) h \(total % 60) m"
     }
 }
+
+/// Every recorded sample as a dot, joined by a thin line within continuous stretches
+/// (a gap over `gapSeconds` breaks the line). Drag across it to read exact values.
+struct SampleChart: View {
+    let kind: MetricKind
+    let samples: [Sample]
+    var height: CGFloat = 160
+    var gapSeconds: TimeInterval = 30 * 60
+
+    @State private var selected: Date?
+
+    private struct Point: Identifiable {
+        let id: Int64
+        let date: Date
+        let value: Double
+        let segment: Int
+    }
+
+    private var points: [Point] {
+        var segment = 0
+        var last: Double?
+        return samples.map { s in
+            if let last, s.ts - last > gapSeconds { segment += 1 }
+            last = s.ts
+            return Point(id: s.id, date: Date(timeIntervalSince1970: s.ts), value: s.value, segment: segment)
+        }
+    }
+
+    private func nearest(to date: Date, in points: [Point]) -> Point? {
+        points.min { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) }
+    }
+
+    var body: some View {
+        if samples.isEmpty {
+            ContentUnavailableView("No \(kind.title.lowercased()) yet", systemImage: kind.symbol,
+                                   description: Text(kind.emptyHint))
+                .frame(height: height)
+        } else {
+            let points = self.points
+            let pick = selected.flatMap { nearest(to: $0, in: points) }
+            Chart {
+                ForEach(points) { p in
+                    LineMark(x: .value("Time", p.date), y: .value(kind.title, p.value),
+                             series: .value("Stretch", p.segment))
+                        .foregroundStyle(kind.tint.opacity(0.45))
+                        .lineStyle(StrokeStyle(lineWidth: 1))
+                    PointMark(x: .value("Time", p.date), y: .value(kind.title, p.value))
+                        .foregroundStyle(kind.tint)
+                        .symbolSize(points.count > 1500 ? 4 : 10)
+                }
+                if let pick {
+                    RuleMark(x: .value("Selected", pick.date))
+                        .foregroundStyle(.white.opacity(0.3))
+                        .annotation(position: .top, overflowResolution: .init(x: .fit(to: .chart), y: .disabled)) {
+                            VStack(spacing: 2) {
+                                Text("\(kind.format(pick.value)) \(kind.unit)").font(.caption.weight(.semibold))
+                                Text(pick.date.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+                        }
+                    PointMark(x: .value("Time", pick.date), y: .value(kind.title, pick.value))
+                        .foregroundStyle(.white)
+                        .symbolSize(40)
+                }
+            }
+            .chartXSelection(value: $selected)
+            .chartYScale(domain: .automatic(includesZero: false))
+            .chartXAxis {
+                AxisMarks(values: .automatic(desiredCount: 4)) { _ in
+                    AxisGridLine().foregroundStyle(.white.opacity(0.06))
+                    AxisValueLabel()
+                }
+            }
+            .chartYAxis {
+                AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) { _ in
+                    AxisGridLine().foregroundStyle(.white.opacity(0.06))
+                    AxisValueLabel()
+                }
+            }
+            .frame(height: height)
+        }
+    }
+}

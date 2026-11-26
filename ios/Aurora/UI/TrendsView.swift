@@ -100,7 +100,13 @@ struct MetricDetailView: View {
                 }
                 .pickerStyle(.segmented)
                 Card {
-                    BucketChart(kind: kind, buckets: buckets, bucketSeconds: range.bucket, height: 240)
+                    // Day and week: every reading (drag to read one). Longer ranges get
+                    // too dense to read, so they show ranges and averages instead.
+                    if range == .day || range == .week, kind != .sleepSession, kind != .sleepStage {
+                        SampleChart(kind: kind, samples: raw, height: 240)
+                    } else {
+                        BucketChart(kind: kind, buckets: buckets, bucketSeconds: range.bucket, height: 240)
+                    }
                 }
                 Card {
                     let values = raw.map(\.value)
