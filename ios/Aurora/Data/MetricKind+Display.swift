@@ -63,3 +63,17 @@ extension MetricKind: CaseIterable, Identifiable {
         }
     }
 }
+
+extension MetricKind {
+    /// What an empty chart tells the user: when this metric is expected to appear.
+    var emptyHint: String {
+        switch self {
+        case .respiratoryRate: "Breathing rate is measured while you sleep. It appears after a night with the ring on."
+        case .spo2: "Blood oxygen is measured while you sleep. It appears after a night with the ring on."
+        case .sleepSession, .sleepStage: "Appears after a night with the ring on."
+        case .skinTemperature: "Appears once the ring has been worn for a while and synced."
+        case .hrv: "Mostly measured at night. Appears after a night with the ring on."
+        default: "Sync your ring to fill this in."
+        }
+    }
+}

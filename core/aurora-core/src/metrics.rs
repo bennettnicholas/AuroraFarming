@@ -205,8 +205,7 @@ pub(crate) fn points_for_event(tag: u8, ds: i64, decoded: &Value) -> Vec<RingPoi
                 }
             }
         }
-        // sleep_temp_event: the calibrated nocturnal skin-temperature stream. The
-        // generic temp_event mixes device/ambient channels, so it is not charted.
+        // sleep_temp_event: the calibrated nocturnal skin-temperature stream.
         0x75 => {
             let temps: Vec<f64> = numbers(decoded, "temps_c")
                 .into_iter()
@@ -214,6 +213,31 @@ pub(crate) fn points_for_event(tag: u8, ds: i64, decoded: &Value) -> Vec<RingPoi
                 .collect();
             if let Some(m) = mean(&temps) {
                 out.push(point(MetricKind::SkinTemperature, ds, (m * 100.0).round() / 100.0));
+            }
+        }
+        // temp_event: the daytime temperature stream. Its channels mix skin and
+        // device/ambient sensors; the warmest plausible channel is the skin side.
+        // Values under 28 °C mean the ring was off the finger, so they are skipped.
+        0x46 => {
+            let skin = numbers(decoded, "temps_c")
+                .into_iter()
+                .filter(|c| (28.0..=40.0).contains(c))
+                .fold(None, |m: Option<f64>, c| Some(m.map_or(c, |m| m.max(c))));
+            if let Some(c) = skin {
+                out.push(point(MetricKind::SkinTemperature, ds, (c * 100.0).round() / 100.0));
+            }
+        }
+        // spo2_r_pi_event: Ring 5 logs the red/infrared ratio (r), not a percentage.
+        // Convert with the app's "SpO2 Simple" quadratic 105.2 - 5.1r - 13.4r² (gen4, see
+        // open_oura docs/spo2-calibration.md), clamped to 85-100 like the app.
+        0x8b => {
+            let vals: Vec<f64> = numbers(decoded, "r")
+                .into_iter()
+                .filter(|r| (0.2..=1.5).contains(r))
+                .map(|r| oura_analysis::ported::spo2::spo2_simple(r, 105.2, -5.1, -13.4).clamp(85.0, 100.0))
+                .collect();
+            if let Some(m) = mean(&vals) {
+                out.push(point(MetricKind::Spo2, ds, (m * 10.0).round() / 10.0));
             }
         }
         // spo2_event: 1 Hz SpO2 percentages; one mean per record.
@@ -373,6 +397,15 @@ mod tests {
         let v = decode_event_body(0x6f, &[0x01, 97, 98, 0xff]).unwrap();
         assert_eq!(points_for_event(0x6f, 1, &v)[0].value, 97.5);
         // 34.50 °C and 34.70 °C as centi-degrees LE
+        // temp_event: ambient 24.00 °C channel ignored, skin 33.50 °C kept.
+        let v = decode_event_body(0x46, &[0x60, 0x09, 0x16, 0x0d]).unwrap();
+        assert_eq!(points_for_event(0x46, 1, &v)[0].value, 33.5);
+        // Off the finger (all channels cool): nothing.
+        let v = decode_event_body(0x46, &[0x60, 0x09, 0x60, 0x09]).unwrap();
+        assert!(points_for_event(0x46, 1, &v).is_empty());
+        // spo2_r_pi_event: r = 0.5 (0x2000/16384) → 105.2 - 2.55 - 3.35 = 99.3 %.
+        let v = decode_event_body(0x8b, &[0x00, 0x20, 0x00, 0x80]).unwrap();
+        assert_eq!(points_for_event(0x8b, 1, &v)[0].value, 99.3);
         let v = decode_event_body(0x75, &[0x7a, 0x0d, 0x8e, 0x0d]).unwrap();
         assert_eq!(points_for_event(0x75, 1, &v)[0].value, 34.6);
     }

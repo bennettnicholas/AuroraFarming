@@ -65,7 +65,7 @@ struct BucketChart: View {
     var body: some View {
         if buckets.isEmpty {
             ContentUnavailableView("No \(kind.title.lowercased()) yet", systemImage: kind.symbol,
-                                   description: Text("Sync your ring to fill this in."))
+                                   description: Text(kind.emptyHint))
                 .frame(height: height)
         } else {
             Chart(buckets, id: \.start) { b in

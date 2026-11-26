@@ -45,9 +45,14 @@ CREATE TABLE IF NOT EXISTS connector_state (
 "#;
 
 /// Event tags [`crate::metrics`] derives samples from.
-const METRIC_TAGS: &str = "80, 93, 106, 111, 117, 118, 90, 128";
-// 0x50=80 activity, 0x5d=93 hrv, 0x6a=106 sleep period, 0x6f=111 spo2,
-// 0x75=117 sleep temp, 0x76=118 bedtime, 0x5a=90 sleep stages, 0x80=128 green IBI.
+const METRIC_TAGS: &str = "70, 80, 93, 106, 111, 117, 118, 90, 128, 139";
+// 0x46=70 temp, 0x50=80 activity, 0x5d=93 hrv, 0x6a=106 sleep period, 0x6f=111 spo2,
+// 0x75=117 sleep temp, 0x76=118 bedtime, 0x5a=90 sleep stages, 0x80=128 green IBI,
+// 0x8b=139 spo2 r/pi.
+
+/// Bump when [`crate::metrics`] derives samples from more events or differently;
+/// stores opened with an older version are rebuilt once from their raw events.
+const DERIVE_VERSION: &str = "2";
 
 /// Events captured this recently are re-derived on every refresh, so a time anchor
 /// that arrives in a later sync re-dates them.
@@ -386,10 +391,16 @@ impl AuroraStore {
         let conn = Connection::open(&path)?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch(SCHEMA)?;
-        Ok(std::sync::Arc::new(Self {
+        let stale = get_meta(&conn, "derive_version")?.as_deref() != Some(DERIVE_VERSION);
+        let store = std::sync::Arc::new(Self {
             path,
             inner: Mutex::new(Inner { raw, conn }),
-        }))
+        });
+        if stale {
+            store.rebuild_samples()?;
+            set_meta(&store.lock().conn, "derive_version", DERIVE_VERSION)?;
+        }
+        Ok(store)
     }
 
     pub fn path(&self) -> String {
