@@ -8,6 +8,7 @@ enum SyncTrigger: String, Codable {
     case foregroundTimer = "Every 5 min (app open)"
     case backgroundWake = "Background (ring wake)"
     case backgroundRefresh = "Background refresh"
+    case watch = "Watch heart rate"
 }
 
 struct SyncRecord: Codable, Identifiable, Equatable {
