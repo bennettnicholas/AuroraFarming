@@ -168,32 +168,68 @@ impl RingSession {
         Ok(frames.iter().flat_map(|f| Packet::parse_many(f)).collect())
     }
 
+    /// One request/response with a custom quiet window.
+    async fn ext_request_wait(
+        &self,
+        req: &[u8],
+        ext: u8,
+        quiet: std::time::Duration,
+    ) -> Result<Vec<Packet>, CoreError> {
+        let frames = transact_until(self.client.transport(), req, quiet, |f| {
+            Packet::parse_many(f).iter().any(|p| p.ext_tag() == Some(ext))
+        })
+        .await?;
+        Ok(frames.iter().flat_map(|f| Packet::parse_many(f)).collect())
+    }
+
+    /// The auth handshake, retried. Right after a connection (and especially on a
+    /// background wake) the ring often drops or answers the first request late, which
+    /// used to surface as "the ring did not send an auth challenge". Each attempt
+    /// asks for a fresh nonce, waits longer, and pauses a little before the next.
     async fn key_status_inner(&self, key: &[u8; 16]) -> Result<KeyStatus, CoreError> {
-        let packets = self.ext_request(&protocol::req_auth_nonce(), 0x2c).await?;
-        let nonce = packets
-            .iter()
-            .find(|p| p.ext_tag() == Some(0x2c) && p.payload.len() > 1)
-            .map(|p| p.payload[1..].to_vec())
-            .ok_or_else(|| CoreError::Ring {
-                message: "the ring did not send an auth challenge".into(),
-            })?;
-        let encrypted = encrypt_nonce(key, &nonce);
-        let packets = self
-            .ext_request(&protocol::req_authenticate(&encrypted), 0x2e)
-            .await?;
-        let state = packets
-            .iter()
-            .find(|p| p.ext_tag() == Some(0x2e))
-            .and_then(|p| p.payload.get(1).copied())
-            .ok_or_else(|| CoreError::Ring {
-                message: "the ring did not answer the auth response".into(),
-            })?;
-        Ok(match AuthResult::from(state) {
-            AuthResult::Success => KeyStatus::Accepted,
-            AuthResult::AuthenticationError => KeyStatus::WrongKey,
-            AuthResult::InFactoryReset => KeyStatus::FactoryReset,
-            AuthResult::NotOriginalOnboardedDevice => KeyStatus::OtherDevice,
-            AuthResult::Unknown(_) => KeyStatus::Unknown,
+        const ATTEMPTS: u32 = 4;
+        let mut last_error = String::new();
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
+            }
+            let wait = std::time::Duration::from_millis(2500 + 1000 * attempt as u64);
+            let packets = self
+                .ext_request_wait(&protocol::req_auth_nonce(), 0x2c, wait)
+                .await?;
+            let Some(nonce) = packets
+                .iter()
+                .find(|p| p.ext_tag() == Some(0x2c) && p.payload.len() > 1)
+                .map(|p| p.payload[1..].to_vec())
+            else {
+                last_error = format!(
+                    "the ring did not send an auth challenge ({} other packet(s))",
+                    packets.len()
+                );
+                continue;
+            };
+            let encrypted = encrypt_nonce(key, &nonce);
+            let packets = self
+                .ext_request_wait(&protocol::req_authenticate(&encrypted), 0x2e, wait)
+                .await?;
+            let Some(state) = packets
+                .iter()
+                .find(|p| p.ext_tag() == Some(0x2e))
+                .and_then(|p| p.payload.get(1).copied())
+            else {
+                last_error = "the ring did not answer the auth response".into();
+                continue;
+            };
+            return Ok(match AuthResult::from(state) {
+                AuthResult::Success => KeyStatus::Accepted,
+                AuthResult::AuthenticationError => KeyStatus::WrongKey,
+                AuthResult::InFactoryReset => KeyStatus::FactoryReset,
+                AuthResult::NotOriginalOnboardedDevice => KeyStatus::OtherDevice,
+                AuthResult::Unknown(_) => KeyStatus::Unknown,
+            });
+        }
+        Err(CoreError::Ring {
+            message: format!("{last_error} after {ATTEMPTS} tries"),
         })
     }
 
@@ -534,6 +570,15 @@ mod tests {
     async fn key_status_accepts_the_right_key() {
         let (_ring, s) = ring_with_auth();
         assert_eq!(s.key_status(KEY.into()).await.unwrap(), KeyStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn auth_retries_when_the_ring_misses_the_first_requests() {
+        let (ring, s) = ring_with_auth();
+        ring.ignore.lock().unwrap().insert("2f012b".into(), 2);
+        assert_eq!(s.key_status(KEY.into()).await.unwrap(), KeyStatus::Accepted);
+        let nonce_requests = ring.writes.lock().unwrap().iter().filter(|w| *w == "2f012b").count();
+        assert_eq!(nonce_requests, 3);
     }
 
     #[tokio::test]

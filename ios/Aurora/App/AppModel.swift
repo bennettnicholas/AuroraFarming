@@ -118,6 +118,9 @@ final class AppModel {
     /// is simply not nearby.
     func syncNow(userInitiated: Bool = true) async {
         guard let key = Keychain.get(Keychain.ringKeyAccount), !syncPhase.isBusy else { return }
+        // If the app went to the background mid-sync, the next wake is scheduled here,
+        // once the link is free (scheduling it drops the current connection).
+        defer { if !isInForeground && continuousSync && hasKey { scheduleNextWake() } }
         let maxAttempts = userInitiated ? 3 : 2
         var lastError: Error?
         for attempt in 1...maxAttempts {
@@ -205,7 +208,9 @@ final class AppModel {
         isInForeground = false
         foregroundTimer?.invalidate()
         foregroundTimer = nil
-        if continuousSync, hasKey, !isStreamingHeartRate { scheduleNextWake() }
+        // Scheduling a wake drops the current link, so never do it mid-sync or mid-stream;
+        // the sync schedules it when it finishes.
+        if continuousSync, hasKey, !isStreamingHeartRate, !syncPhase.isBusy { scheduleNextWake() }
     }
 
     func didBecomeActive() {
@@ -231,8 +236,7 @@ final class AppModel {
         let task = UIApplication.shared.beginBackgroundTask(withName: "aurora.sync")
         defer { if task != .invalid { UIApplication.shared.endBackgroundTask(task) } }
         DiagnosticsLog.shared.add("scheduled wake: syncing (foreground=\(isInForeground))")
-        await syncNow(userInitiated: false)
-        if !isInForeground && continuousSync { scheduleNextWake() }
+        await syncNow(userInitiated: false) // schedules the next wake when done
     }
 
     // MARK: - Pairing

@@ -71,6 +71,8 @@ pub(crate) mod tests {
         pub replies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
         pub writes: Mutex<Vec<String>>,
         pub sink: Mutex<Option<Arc<crate::session::RingSession>>>,
+        /// Requests the ring "misses" this many more times before it answers.
+        pub ignore: Mutex<HashMap<String, u32>>,
     }
 
     impl ScriptedRing {
@@ -79,6 +81,7 @@ pub(crate) mod tests {
                 replies: Mutex::new(HashMap::new()),
                 writes: Mutex::new(Vec::new()),
                 sink: Mutex::new(None),
+                ignore: Mutex::new(HashMap::new()),
             })
         }
         pub fn on(&self, req: &str, frames: &[&str]) {
@@ -95,6 +98,12 @@ pub(crate) mod tests {
         fn write(&self, data: Vec<u8>) -> bool {
             let key = hex::encode(&data);
             self.0.writes.lock().unwrap().push(key.clone());
+            if let Some(n) = self.0.ignore.lock().unwrap().get_mut(&key) {
+                if *n > 0 {
+                    *n -= 1;
+                    return true;
+                }
+            }
             let frames = self.0.replies.lock().unwrap().get(&key).cloned();
             let sink = self.0.sink.lock().unwrap().clone();
             if let (Some(frames), Some(sink)) = (frames, sink) {
