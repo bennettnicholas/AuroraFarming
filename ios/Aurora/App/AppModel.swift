@@ -102,38 +102,83 @@ final class AppModel {
     func syncIfStale(minimumInterval: TimeInterval = 15 * 60) async {
         guard hasKey, !syncPhase.isBusy else { return }
         if let last = lastSync, Date.now.timeIntervalSince(last) < minimumInterval { return }
-        await syncNow()
+        await syncNow(userInitiated: false)
     }
 
-    func syncNow() async {
+    /// Sync with the ring, retrying link failures.
+    ///
+    /// A worn ring advertises rarely and can drop the link mid-download, so a
+    /// single attempt fails often. Each retry tears the link down and reconnects;
+    /// the stored cursor makes a retried download resume, not restart. Automatic
+    /// (launch / background) syncs that cannot reach the ring fail quietly: the ring
+    /// is simply not nearby.
+    func syncNow(userInitiated: Bool = true) async {
         guard let key = Keychain.get(Keychain.ringKeyAccount), !syncPhase.isBusy else { return }
-        syncPhase = .connecting
-        do {
-            let session = try await ble.connect()
-            if ringInfo == nil { ringInfo = try? await session.info() }
-            if let info = ringInfo {
-                UserDefaults.standard.set(info.isRing5 ? "Oura Ring 5" : "Oura Ring (\(info.hardwareId))",
-                                          forKey: "aurora.ring.model")
+        let maxAttempts = userInitiated ? 3 : 2
+        var lastError: Error?
+        for attempt in 1...maxAttempts {
+            if attempt > 1 {
+                ble.disconnect()
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 2_000_000_000)
             }
-            let listener = SyncProgress { [weak self] phase in
-                // Callbacks hop to the main actor and can land after the sync returned.
-                guard let self, case .running = self.syncPhase else { return }
-                self.syncPhase = phase
+            syncPhase = .connecting
+            do {
+                try await syncOnce(key: key)
+                return
+            } catch {
+                lastError = error
+                DiagnosticsLog.shared.add("sync attempt \(attempt) failed: \(error.localizedDescription)")
+                log.error("sync attempt \(attempt) failed: \(error.localizedDescription, privacy: .public)")
+                if !Self.isRetryable(error) { break }
             }
-            syncPhase = .running(stage: .authenticating, events: 0, bytesLeft: 0)
-            let report = try await session.sync(keyHex: key, store: store, listener: listener)
-            if let pct = report.batteryPercent {
-                battery = BatteryStatus(percent: pct, chargingProgress: battery?.chargingProgress ?? 0,
-                                        chargingRecommended: pct < 20)
-            }
-            device = try? store.device()
-            dataVersion += 1
-            syncPhase = .finished(report)
-            await connectors.exportAll()
-        } catch {
-            log.error("sync failed: \(error.localizedDescription, privacy: .public)")
-            syncPhase = .failed(error.localizedDescription)
         }
+        let message = lastError?.localizedDescription ?? "Sync failed."
+        if !userInitiated, let lastError, Self.isRetryable(lastError) {
+            syncPhase = .idle // ring out of range: not worth an alarm
+        } else {
+            syncPhase = .failed(message)
+        }
+    }
+
+    /// Link problems are worth another try; a rejected key or a full disk is not.
+    static func isRetryable(_ error: Error) -> Bool {
+        if let ble = error as? RingBluetooth.BLEError {
+            if case .bluetoothUnavailable = ble { return false }
+            return true
+        }
+        if let core = error as? CoreError {
+            switch core {
+            case .Link, .Ring: return true
+            case .Auth, .Store, .InvalidKey: return false
+            }
+        }
+        return error is CancellationError ? false : true
+    }
+
+    private func syncOnce(key: String) async throws {
+        DiagnosticsLog.shared.add("sync: connecting")
+        let session = try await ble.connect()
+        if ringInfo == nil { ringInfo = try? await session.info() }
+        if let info = ringInfo {
+            UserDefaults.standard.set(info.isRing5 ? "Oura Ring 5" : "Oura Ring (\(info.hardwareId))",
+                                      forKey: "aurora.ring.model")
+        }
+        let listener = SyncProgress { [weak self] phase in
+            // Callbacks hop to the main actor and can land after the sync returned.
+            guard let self, case .running = self.syncPhase else { return }
+            self.syncPhase = phase
+        }
+        syncPhase = .running(stage: .authenticating, events: 0, bytesLeft: 0)
+        let report = try await session.sync(keyHex: key, store: store, listener: listener)
+        if let pct = report.batteryPercent {
+            battery = BatteryStatus(percent: pct, chargingProgress: battery?.chargingProgress ?? 0,
+                                    chargingRecommended: pct < 20)
+        }
+        device = try? store.device()
+        dataVersion += 1
+        syncPhase = .finished(report)
+        DiagnosticsLog.shared.add("sync ok: \(report.eventsReceived) events, \(report.newEvents) new, warnings \(report.warnings)")
+        await connectors.exportAll()
     }
 
     // MARK: - Pairing
@@ -228,17 +273,60 @@ final class AppModel {
         return try await ble.connect().enableMeasurements(keyHex: key)
     }
 
-    func streamHeartRate(seconds: UInt32 = 60) async {
+    /// Live heart rate: `liveIsFallback` is true while the value shown is the ring's
+    /// latest automatic reading rather than a live beat.
+    private(set) var liveIsFallback = false
+    private(set) var liveError: String?
+    private(set) var liveStatus: String?
+    private var liveSession: RingSession?
+
+    func streamHeartRate(seconds: UInt32 = 120) async {
         guard let key = Keychain.get(Keychain.ringKeyAccount), !isStreamingHeartRate else { return }
         isStreamingHeartRate = true
         liveHeartRate = nil
-        defer { isStreamingHeartRate = false }
+        liveError = nil
+        liveIsFallback = false
+        liveStatus = "Connecting to your ring…"
+        defer {
+            isStreamingHeartRate = false
+            liveSession = nil
+            liveStatus = nil
+        }
         do {
-            let session = try await ble.connect()
-            let listener = LiveHeartRate { [weak self] bpm in self?.liveHeartRate = bpm }
-            try await session.liveHeartRate(keyHex: key, seconds: seconds, listener: listener)
+            let session = try await connectWithRetry()
+            liveSession = session
+            liveStatus = "Waiting for beats. Keep the ring snug and your hand still."
+            let listener = LiveHeartRate { [weak self] bpm, live in
+                guard let self, self.isStreamingHeartRate else { return }
+                self.liveHeartRate = bpm
+                self.liveIsFallback = !live
+                self.liveStatus = live ? nil : "Latest automatic reading. Live beats haven't arrived yet."
+            }
+            let beats = try await session.liveHeartRate(keyHex: key, seconds: seconds, listener: listener)
+            DiagnosticsLog.shared.add("live HR ended: \(beats) live beats")
+            if beats == 0 && liveHeartRate == nil {
+                liveError = "No heart-rate readings arrived. Make sure the ring is on your finger and snug, then try again."
+            }
         } catch {
+            DiagnosticsLog.shared.add("live HR failed: \(error.localizedDescription)")
             log.error("live HR: \(error.localizedDescription, privacy: .public)")
+            liveError = error.localizedDescription
+        }
+    }
+
+    func stopHeartRate() {
+        liveSession?.stopLiveHeartRate()
+    }
+
+    /// Connect, retrying once after tearing down a possibly stale link.
+    private func connectWithRetry() async throws -> RingSession {
+        do {
+            return try await ble.connect()
+        } catch let error as RingBluetooth.BLEError {
+            if case .bluetoothUnavailable = error { throw error }
+            ble.disconnect()
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            return try await ble.connect()
         }
     }
 
@@ -303,9 +391,10 @@ private final class SyncProgress: SyncListener, @unchecked Sendable {
 }
 
 private final class LiveHeartRate: HeartRateListener, @unchecked Sendable {
-    private let update: @MainActor (UInt16) -> Void
-    init(update: @escaping @MainActor (UInt16) -> Void) { self.update = update }
+    /// `(bpm, isLiveBeat)`; a reading with `ibiMs == 0` is the ring's latest automatic value.
+    private let update: @MainActor (UInt16, Bool) -> Void
+    init(update: @escaping @MainActor (UInt16, Bool) -> Void) { self.update = update }
     func onHeartRate(bpm: UInt16, ibiMs: UInt16) {
-        Task { @MainActor in update(bpm) }
+        Task { @MainActor in update(bpm, ibiMs > 0) }
     }
 }

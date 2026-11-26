@@ -6,10 +6,11 @@
 //! and live heart rate. Calls are serialised: the ring protocol is strictly
 //! request/response, so two overlapping requests would steal each other's replies.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use oura_link::transport::transact_until;
+use oura_link::transport::{transact_until, Transport};
 use oura_link::OuraClient;
 use oura_protocol::auth::{encrypt_nonce, AuthResult};
 use oura_protocol::protocol::{self, feature, feature_mode, Packet};
@@ -115,6 +116,24 @@ pub struct RingSession {
     client: OuraClient<FfiTransport>,
     /// Serialises protocol operations (see module docs).
     op: tokio::sync::Mutex<()>,
+    /// Set by `stop_live_heart_rate` to end a live stream early.
+    stop_live: AtomicBool,
+}
+
+/// A live heart-rate packet: `0x2f` ext `0x28` for the daytime-HR feature, with a
+/// 12-bit IBI and a 4-bit validity nibble (same layout open_oura's CLI uses).
+/// Parsed per packet, not per notification, because Ring 5 packs several packets
+/// into one notification.
+pub(crate) fn parse_live_hr(p: &Packet) -> Option<(u16, u16)> {
+    if p.tag != 0x2f || p.payload.len() < 8 || p.payload[0] != 0x28 || p.payload[1] != feature::DAYTIME_HR {
+        return None;
+    }
+    let (lo, hi) = (p.payload[6], p.payload[7]);
+    if (hi >> 4) & 0x0f != 1 {
+        return None;
+    }
+    let ibi = (((hi & 0x0f) as u16) << 8) | lo as u16;
+    (300..=2000).contains(&ibi).then(|| (60_000 / ibi, ibi))
 }
 
 fn mode_name(mode: u8) -> &'static str {
@@ -234,6 +253,7 @@ impl RingSession {
         Arc::new(Self {
             client: OuraClient::new(FfiTransport::new(link)),
             op: tokio::sync::Mutex::new(()),
+            stop_live: AtomicBool::new(false),
         })
     }
 
@@ -329,23 +349,71 @@ impl RingSession {
         })
     }
 
-    /// Stream live heart rate for `seconds` (ring must be worn). Restores automatic
-    /// measurement afterwards.
+    /// Stream live heart rate for up to `seconds` (ring must be worn), until
+    /// [`Self::stop_live_heart_rate`]. Puts the ring's heart-rate feature in its
+    /// connected-live mode and restores automatic measurement afterwards. Returns
+    /// the number of valid beats received. While no beats arrive, the ring's latest
+    /// automatic reading is reported every few seconds with `ibi_ms == 0`.
     pub async fn live_heart_rate(
         &self,
         key_hex: String,
         seconds: u32,
         listener: Box<dyn HeartRateListener>,
-    ) -> Result<(), CoreError> {
+    ) -> Result<u32, CoreError> {
         let key = parse_key(&key_hex)?;
         let _g = self.op.lock().await;
         self.authenticate(&key).await?;
-        self.client
-            .live_heart_rate(Duration::from_secs(seconds.min(600) as u64), false, |s| {
-                listener.on_heart_rate(s.bpm, s.ibi_ms)
-            })
+        self.stop_live.store(false, Ordering::SeqCst);
+        let transport = self.client.transport();
+        let mut rx = transport.subscribe();
+        transport
+            .write(&protocol::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::CONNECTED_LIVE))
             .await?;
-        Ok(())
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds.clamp(5, 600) as u64);
+        let mut beats = 0u32;
+        let mut last_beat = tokio::time::Instant::now();
+        let mut last_poll = tokio::time::Instant::now();
+        while !self.stop_live.load(Ordering::SeqCst) {
+            // No live beats for a while (ring still settling, loose fit, or a firmware
+            // that does not stream): fall back to the ring's latest automatic reading,
+            // reported with ibi_ms = 0 so the UI can label it as such.
+            let now = tokio::time::Instant::now();
+            if now - last_beat > Duration::from_secs(6) && now - last_poll > Duration::from_secs(5) {
+                last_poll = now;
+                if let Ok(v) = self.client.feature_latest(feature::DAYTIME_HR).await {
+                    if let Some(bpm) = v.bpm.filter(|b| (30..=220).contains(b)) {
+                        listener.on_heart_rate(bpm, 0);
+                    }
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining.min(Duration::from_millis(500)), rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    for p in Packet::parse_many(&frame) {
+                        if let Some((bpm, ibi)) = parse_live_hr(&p) {
+                            beats += 1;
+                            last_beat = tokio::time::Instant::now();
+                            listener.on_heart_rate(bpm, ibi);
+                        }
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => break, // link gone
+                Err(_) => continue,  // no frame this half-second; check stop + deadline
+            }
+        }
+        let _ = transport
+            .write(&protocol::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::AUTOMATIC))
+            .await;
+        Ok(beats)
+    }
+
+    /// End a running [`Self::live_heart_rate`] stream within half a second.
+    pub fn stop_live_heart_rate(&self) {
+        self.stop_live.store(true, Ordering::SeqCst);
     }
 
     /// Full sync: authenticate, run the Ring 5 app-style setup, align the ring
@@ -482,6 +550,33 @@ mod tests {
             s.battery(hex::encode([0u8; 16])).await,
             Err(CoreError::Auth { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn live_heart_rate_parses_packed_notifications() {
+        struct Beats(Arc<Mutex<Vec<u16>>>);
+        impl HeartRateListener for Beats {
+            fn on_heart_rate(&self, bpm: u16, _ibi_ms: u16) {
+                self.0.lock().unwrap().push(bpm);
+            }
+        }
+        let (ring, s) = ring_with_auth();
+        let live = hex::encode(protocol::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::CONNECTED_LIVE));
+        // Two packets in one notification (Ring 5 packs them): IBI 1000 ms valid,
+        // IBI 750 ms valid; then one invalid beat (validity nibble 2).
+        ring.on(&live, &["2f08280200000000e8132f08280200000000ee12", "2f08280200000000e823"]);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let s2 = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            s2.stop_live_heart_rate();
+        });
+        let n = s
+            .live_heart_rate(KEY.into(), 30, Box::new(Beats(got.clone())))
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(*got.lock().unwrap(), vec![60, 80]);
     }
 
     #[tokio::test]

@@ -50,6 +50,11 @@ struct SettingsView: View {
             } footer: {
                 Text("Removes the ring key from this iPhone. Keep a copy first if the ring is not paired anywhere else: without the key the ring must be factory-reset to pair again.")
             }
+            Section {
+                NavigationLink("Bluetooth log") { DiagnosticsLogView() }
+            } footer: {
+                Text("If syncing or live heart rate misbehaves, open this right after it happens and share it. It never contains your ring key.")
+            }
             Section("About") {
                 LabeledContent("Core", value: coreVersion())
                 Link("Protocol work: open_oura", destination: URL(string: "https://github.com/Th0rgal/open_oura")!)
@@ -81,5 +86,31 @@ private struct EventCountsView: View {
             }
         }
         .navigationTitle("Event types")
+    }
+}
+
+private struct DiagnosticsLogView: View {
+    @State private var text = DiagnosticsLog.shared.text
+
+    var body: some View {
+        ScrollView {
+            Text(text.isEmpty ? "Nothing logged yet." : text)
+                .font(.caption2.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+        }
+        .navigationTitle("Bluetooth log")
+        .toolbar {
+            ToolbarItemGroup {
+                Button("Copy") { UIPasteboard.general.string = text }
+                ShareLink(item: text)
+                Button("Clear") {
+                    DiagnosticsLog.shared.clear()
+                    text = ""
+                }
+            }
+        }
+        .onAppear { text = DiagnosticsLog.shared.text }
     }
 }

@@ -74,29 +74,45 @@ struct RingView: View {
 
     private var liveCard: some View {
         Card {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    SectionHeader(title: "Live heart rate", symbol: "heart.fill")
-                    Text("Streams beat-to-beat heart rate for a minute. Wear the ring.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if model.isStreamingHeartRate {
-                    HStack(alignment: .firstTextBaseline, spacing: 2) {
-                        Text(model.liveHeartRate.map { "\($0)" } ?? "…")
-                            .font(.system(size: 40, weight: .bold, design: .rounded))
-                            .contentTransition(.numericText())
-                            .foregroundStyle(Theme.rose)
-                        Text("bpm").font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        SectionHeader(title: "Live heart rate", symbol: "heart.fill")
+                        Text("Beat-to-beat heart rate for up to two minutes. Wear the ring.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
-                } else {
+                    Spacer()
                     Button {
-                        Task { await model.streamHeartRate() }
+                        if model.isStreamingHeartRate {
+                            model.stopHeartRate()
+                        } else {
+                            Task { await model.streamHeartRate() }
+                        }
                     } label: {
-                        Image(systemName: "play.fill").padding(10)
+                        Image(systemName: model.isStreamingHeartRate ? "stop.fill" : "play.fill").padding(10)
                     }
                     .buttonStyle(.borderedProminent)
+                    .tint(model.isStreamingHeartRate ? Theme.rose : Theme.mint)
                     .clipShape(Circle())
+                }
+                if model.isStreamingHeartRate || model.liveHeartRate != nil {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text(model.liveHeartRate.map { "\($0)" } ?? "–")
+                            .font(.system(size: 52, weight: .bold, design: .rounded))
+                            .contentTransition(.numericText())
+                            .foregroundStyle(model.liveIsFallback ? Theme.amber : Theme.rose)
+                            .animation(.snappy, value: model.liveHeartRate)
+                        Text("bpm").font(.subheadline).foregroundStyle(.secondary)
+                        Spacer()
+                        if model.isStreamingHeartRate { ProgressView() }
+                    }
+                }
+                if let status = model.liveStatus {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
+                if let error = model.liveError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(Theme.amber)
                 }
             }
         }

@@ -33,7 +33,7 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
             switch self {
             case .bluetoothUnavailable(let why): return "Bluetooth is unavailable: \(why)."
             case .notFound: return "No Oura ring found nearby. Put the ring on its charger to wake it and try again."
-            case .timeout: return "The ring did not respond in time. Put it on its charger and try again."
+            case .timeout: return "Couldn't reach the ring. On your finger it only advertises every few seconds and can be busy measuring; keep the phone close, or put the ring on its charger, and try again."
             case .disconnected(let why): return "The ring disconnected\(why.map { ": \($0)" } ?? ".")"
             case .missingCharacteristic: return "This ring does not expose the expected Oura Bluetooth service."
             }
@@ -52,6 +52,8 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
     private var peripheral: CBPeripheral?
     private var writeCharacteristic: CBCharacteristic?
     private var pendingNotifySubscriptions = 0
+    /// The remembered ring we asked iOS to connect to while also scanning.
+    private var pendingRemembered: CBPeripheral?
     private var session: RingSession?
 
     private var poweredOnWaiters: [CheckedContinuation<Void, Error>] = []
@@ -59,9 +61,11 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
 
     /// Called on the main actor whenever the link state changes.
     var onStateChange: (@MainActor (State) -> Void)?
+    private let diag = DiagnosticsLog.shared
     private(set) var state: State = .idle {
         didSet {
             let s = state
+            if s != oldValue { diag.add("ble state: \(s)") }
             if let cb = onStateChange { Task { @MainActor in cb(s) } }
         }
     }
@@ -82,7 +86,7 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
 
     /// Connect to the ring (the remembered one if possible, otherwise the strongest
     /// one advertising) and return a session ready for protocol calls.
-    func connect(timeout: TimeInterval = 25) async throws -> RingSession {
+    func connect(timeout: TimeInterval = 45) async throws -> RingSession {
         try await waitForPoweredOn()
         if let session = queue.sync(execute: { self.isReady ? self.session : nil }) {
             return session
@@ -148,24 +152,39 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
             previous.resume(throwing: CancellationError())
         }
         connectContinuation = cont
-        // 1) The remembered ring, if iOS still knows it.
-        if let id = rememberedPeripheral,
-           let known = central.retrievePeripherals(withIdentifiers: [id]).first {
-            connectTo(known)
-            return
-        }
-        // 2) A ring already connected to iOS (e.g. by another app).
+        diag.add("connect: start (remembered=\(rememberedPeripheral?.uuidString ?? "none"))")
+        // Drop any half-open link first: a peripheral iOS still calls "connected"
+        // after the ring silently went away makes every request time out.
+        if let p = peripheral, p.state != .disconnected { central.cancelPeripheralConnection(p) }
+        reset()
+
+        // A ring already connected to iOS (e.g. by another app) is the fastest path.
         if let connected = central.retrieveConnectedPeripherals(withServices: [Self.serviceUUID]).first {
             connectTo(connected)
             return
         }
-        // 3) Scan.
-        state = .scanning
+        // Otherwise do both at once: a pending connect to the remembered ring (iOS
+        // completes it the moment the ring advertises, however rarely) AND a scan,
+        // in case the ring's identifier changed (re-pairing, iOS Bluetooth reset).
+        // A worn ring can advertise only every few seconds, so this can take a while.
+        if let id = rememberedPeripheral,
+           let known = central.retrievePeripherals(withIdentifiers: [id]).first {
+            pendingRemembered = known
+            known.delegate = self
+            central.connect(known, options: nil)
+            state = .connecting
+        } else {
+            state = .scanning
+        }
         central.scanForPeripherals(withServices: [Self.serviceUUID], options: nil)
     }
 
     private func connectTo(_ p: CBPeripheral) {
         central.stopScan()
+        if let other = pendingRemembered, other.identifier != p.identifier {
+            central.cancelPeripheralConnection(other)
+        }
+        pendingRemembered = nil
         peripheral = p
         p.delegate = self
         state = .connecting
@@ -180,7 +199,10 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
     }
 
     private func fail(_ error: Error) {
+        diag.add("connect failed: \(error.localizedDescription)")
         central.stopScan()
+        if let p = pendingRemembered, p.state != .disconnected { central.cancelPeripheralConnection(p) }
+        pendingRemembered = nil
         if let p = peripheral, p.state != .disconnected { central.cancelPeripheralConnection(p) }
         reset()
         state = .idle
@@ -197,6 +219,7 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
         UserDefaults.standard.set(p.identifier.uuidString, forKey: Self.rememberedKey)
         state = .connected(name: p.name ?? "Oura Ring")
         log.info("ring ready: \(p.name ?? "?", privacy: .public)")
+        diag.add("ring ready: \(p.name ?? "?") \(p.identifier.uuidString)")
         connectContinuation?.resume(returning: s)
         connectContinuation = nil
     }
@@ -210,6 +233,7 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
             p.writeValue(data, for: c, type: type)
             ok = true
         }
+        if ok { DiagnosticsLog.shared.frame("→", data) } else { DiagnosticsLog.shared.add("→ write refused: not connected") }
         return ok
     }
 
@@ -251,20 +275,40 @@ extension RingBluetooth: CBCentralManagerDelegate {
         let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
         // The charging case advertises too (different service, but be safe).
         guard !name.localizedCaseInsensitiveContains("case") else { return }
+        guard connectContinuation != nil, peripheral == nil else { return }
         log.info("found \(name, privacy: .public) rssi \(RSSI.intValue)")
+        diag.add("found \(name) rssi \(RSSI.intValue) id \(peripheral.identifier.uuidString)")
         connectTo(peripheral)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        diag.add("didConnect \(peripheral.identifier.uuidString)")
+        if self.peripheral == nil || self.peripheral?.identifier != peripheral.identifier {
+            // The pending connect to the remembered ring won the race against the scan.
+            central.stopScan()
+            pendingRemembered = nil
+            self.peripheral = peripheral
+            peripheral.delegate = self
+        }
+        state = .connecting
         peripheral.discoverServices([Self.serviceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        diag.add("didFailToConnect \(peripheral.identifier.uuidString): \(error?.localizedDescription ?? "-")")
+        if peripheral.identifier == pendingRemembered?.identifier, self.peripheral == nil {
+            pendingRemembered = nil // keep scanning; the ring may show up under a new identifier
+            return
+        }
+        guard peripheral.identifier == self.peripheral?.identifier else { return }
         fail(BLEError.disconnected(error?.localizedDescription))
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         log.info("disconnected: \(error?.localizedDescription ?? "-", privacy: .public)")
+        diag.add("didDisconnect \(peripheral.identifier.uuidString): \(error?.localizedDescription ?? "-")")
+        // Ignore links we already abandoned (e.g. the losing side of the scan race).
+        guard peripheral.identifier == self.peripheral?.identifier else { return }
         if connectContinuation != nil {
             fail(BLEError.disconnected(error?.localizedDescription))
         } else {
@@ -294,6 +338,7 @@ extension RingBluetooth: CBPeripheralDelegate {
             return
         }
         // Ring 5 adds …0004/0005/0006; subscribing to all of them mirrors open_oura.
+        diag.add("characteristics: " + chars.map { "\($0.uuid.uuidString.prefix(8)) \($0.properties.rawValue)" }.joined(separator: ", "))
         let notifying = chars.filter { $0.properties.contains(.notify) || $0.properties.contains(.indicate) }
         pendingNotifySubscriptions = notifying.count
         notifying.forEach { peripheral.setNotifyValue(true, for: $0) }
@@ -302,17 +347,25 @@ extension RingBluetooth: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
-        if let error { log.error("notify \(characteristic.uuid): \(error.localizedDescription, privacy: .public)") }
+        if let error {
+            log.error("notify \(characteristic.uuid): \(error.localizedDescription, privacy: .public)")
+            diag.add("notify subscribe failed \(characteristic.uuid.uuidString): \(error.localizedDescription)")
+        }
         pendingNotifySubscriptions = max(0, pendingNotifySubscriptions - 1)
         finishIfReady()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil, let value = characteristic.value, !value.isEmpty else { return }
+        // History-event frames (tag >= 0x41) are thousands per sync: keep them out of the log.
+        if value[value.startIndex] < 0x41 { diag.frame("← \(characteristic.uuid.uuidString.prefix(8))", value) }
         session?.pushNotification(data: value)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        if let error { log.error("write failed: \(error.localizedDescription, privacy: .public)") }
+        if let error {
+            log.error("write failed: \(error.localizedDescription, privacy: .public)")
+            diag.add("write failed: \(error.localizedDescription)")
+        }
     }
 }
