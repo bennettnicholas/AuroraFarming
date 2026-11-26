@@ -70,7 +70,7 @@ extension MetricKind: CaseIterable, Identifiable {
     /// Formats a stored (metric) value in the user's display units.
     func format(_ value: Double) -> String {
         let value = display(value)
-        switch self {
+        return switch self {
         case .skinTemperature: String(format: Units.fahrenheit ? "%.1f" : "%.2f", value)
         case .spo2, .respiratoryRate, .activityMet: String(format: "%.1f", value)
         case .sleepSession: String(format: "%.1f", value)
