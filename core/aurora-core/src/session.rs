@@ -13,7 +13,7 @@ use std::time::Duration;
 use oura_link::transport::{transact_until, Transport};
 use oura_link::OuraClient;
 use oura_protocol::auth::{encrypt_nonce, AuthResult};
-use oura_protocol::protocol::{self, feature, feature_mode, Packet};
+use oura_protocol::protocol::{self, feature, feature_mode, subscription_mode, Packet};
 
 use crate::store::AuroraStore;
 use crate::transport::{FfiTransport, RingLink};
@@ -124,6 +124,26 @@ pub struct RingSession {
 /// 12-bit IBI and a 4-bit validity nibble (same layout open_oura's CLI uses).
 /// Parsed per packet, not per notification, because Ring 5 packs several packets
 /// into one notification.
+/// A daytime-HR latest-values packet (ext `0x25`) the ring pushes on its own once
+/// subscribed: `[0]=0x25 [1]=feature [2]=result [3]=status [4]=state [5..7]=counter
+/// [7..9]=IBI ms`. Polled answers have the same shape; an IBI of 0 means none yet.
+pub(crate) fn parse_pushed_latest_hr(p: &Packet) -> Option<(u16, u16)> {
+    if p.tag != 0x2f || p.payload.len() < 9 || p.payload[0] != 0x25 || p.payload[1] != feature::DAYTIME_HR {
+        return None;
+    }
+    let ibi = u16::from_le_bytes([p.payload[7], p.payload[8]]);
+    (300..=2000).contains(&ibi).then(|| (60_000 / ibi, ibi))
+}
+
+/// The result byte of an ext response (`[0]=ext [1]=id [2]=result`).
+fn ext_result(packets: Result<Vec<Packet>, CoreError>) -> Option<u8> {
+    packets
+        .ok()?
+        .iter()
+        .find(|p| p.tag == 0x2f && p.payload.len() > 2 && matches!(p.payload[0], 0x23 | 0x27))
+        .map(|p| p.payload[2])
+}
+
 pub(crate) fn parse_live_hr(p: &Packet) -> Option<(u16, u16)> {
     if p.tag != 0x2f || p.payload.len() < 8 || p.payload[0] != 0x28 || p.payload[1] != feature::DAYTIME_HR {
         return None;
@@ -251,6 +271,22 @@ impl RingSession {
                 message: "The ring answered the key check with an unknown state.".into(),
             }),
         }
+    }
+
+    /// Subscribe to daytime-HR feature data (and latest values) for a live readout.
+    /// Returns whether the ring accepted one of the subscription shapes.
+    async fn subscribe_live_hr(&self) -> bool {
+        use subscription_mode::{FEATURE_DATA, LATEST};
+        for mode in [FEATURE_DATA | LATEST, FEATURE_DATA, LATEST] {
+            let r = ext_result(
+                self.ext_request(&protocol::req_set_feature_subscription(feature::DAYTIME_HR, mode), 0x27)
+                    .await,
+            );
+            if r == Some(0) {
+                return true;
+            }
+        }
+        false
     }
 
     async fn info_inner(&self) -> Result<RingInfo, CoreError> {
@@ -401,6 +437,11 @@ impl RingSession {
         self.authenticate(&key).await?;
         self.stop_live.store(false, Ordering::SeqCst);
         let transport = self.client.transport();
+        // Ring 5 acks CONNECTED_LIVE but streams nothing while the feature's
+        // subscription is off (GetFeatureStatus reports subscription 0 on a ring set
+        // up outside the Oura app). Subscribe to the daytime-HR feature data first,
+        // the way the Oura app does before its live readout.
+        let subscribed = self.subscribe_live_hr().await;
         let mut rx = transport.subscribe();
         transport
             .write(&protocol::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::CONNECTED_LIVE))
@@ -429,7 +470,7 @@ impl RingSession {
             match tokio::time::timeout(remaining.min(Duration::from_millis(500)), rx.recv()).await {
                 Ok(Ok(frame)) => {
                     for p in Packet::parse_many(&frame) {
-                        if let Some((bpm, ibi)) = parse_live_hr(&p) {
+                        if let Some((bpm, ibi)) = parse_live_hr(&p).or_else(|| parse_pushed_latest_hr(&p)) {
                             beats += 1;
                             last_beat = tokio::time::Instant::now();
                             listener.on_heart_rate(bpm, ibi);
@@ -444,6 +485,15 @@ impl RingSession {
         let _ = transport
             .write(&protocol::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::AUTOMATIC))
             .await;
+        if subscribed {
+            let _ = ext_result(
+                self.ext_request(
+                    &protocol::req_set_feature_subscription(feature::DAYTIME_HR, subscription_mode::OFF),
+                    0x27,
+                )
+                .await,
+            );
+        }
         Ok(beats)
     }
 
@@ -581,6 +631,32 @@ mod tests {
         assert_eq!(nonce_requests, 3);
     }
 
+    #[test]
+    fn pushed_latest_values_count_as_beats() {
+        // From a Ring 5 log: no IBI yet, then a made-up one of 750 ms (80 bpm).
+        let none = Packet::parse_many(&hex::decode("2f1025020001020000000000000000770c7f").unwrap());
+        assert!(none.iter().all(|p| parse_pushed_latest_hr(p).is_none()));
+        let some = Packet::parse_many(&hex::decode("2f1025020001020000ee0200000000770c7f").unwrap());
+        assert_eq!(some.iter().find_map(parse_pushed_latest_hr), Some((80, 750)));
+    }
+
+    #[tokio::test]
+    async fn live_heart_rate_subscribes_first() {
+        struct Nop;
+        impl HeartRateListener for Nop {
+            fn on_heart_rate(&self, _bpm: u16, _ibi_ms: u16) {}
+        }
+        let (ring, s) = ring_with_auth();
+        ring.on("2f03260206", &["2f03270200"]);
+        s.stop_live_heart_rate();
+        let _ = s.live_heart_rate(KEY.into(), 5, Box::new(Nop)).await;
+        let writes = ring.writes.lock().unwrap().clone();
+        let sub = writes.iter().position(|w| w == "2f03260206").expect("subscribed");
+        let live = writes.iter().position(|w| w == "2f03220203").expect("live mode");
+        assert!(sub < live);
+        assert!(writes.contains(&"2f03260200".to_string()), "unsubscribed at the end");
+    }
+
     #[tokio::test]
     async fn wrong_key_is_reported_not_thrown() {
         let (ring, s) = ring_with_auth();
@@ -610,10 +686,11 @@ mod tests {
         // Two packets in one notification (Ring 5 packs them): IBI 1000 ms valid,
         // IBI 750 ms valid; then one invalid beat (validity nibble 2).
         ring.on(&live, &["2f08280200000000e8132f08280200000000ee12", "2f08280200000000e823"]);
+        ring.on("2f03260206", &["2f03270200"]);
         let got = Arc::new(Mutex::new(Vec::new()));
         let s2 = s.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(800)).await;
             s2.stop_live_heart_rate();
         });
         let n = s

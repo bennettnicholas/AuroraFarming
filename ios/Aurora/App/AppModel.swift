@@ -315,8 +315,7 @@ final class AppModel {
     func refreshBattery() async {
         guard let key = Keychain.get(Keychain.ringKeyAccount) else { return }
         do {
-            let session = try await ble.connect()
-            battery = try await session.battery(keyHex: key)
+            battery = try await withRing { try await $0.battery(keyHex: key) }
         } catch {
             log.error("battery: \(error.localizedDescription, privacy: .public)")
         }
@@ -324,12 +323,12 @@ final class AppModel {
 
     func features() async throws -> [FeatureState] {
         guard let key = Keychain.get(Keychain.ringKeyAccount) else { return [] }
-        return try await ble.connect().features(keyHex: key)
+        return try await withRing { try await $0.features(keyHex: key) }
     }
 
     func enableMeasurements() async throws -> [String] {
         guard let key = Keychain.get(Keychain.ringKeyAccount) else { return [] }
-        return try await ble.connect().enableMeasurements(keyHex: key)
+        return try await withRing { try await $0.enableMeasurements(keyHex: key) }
     }
 
     /// Live heart rate: `liveIsFallback` is true while the value shown is the ring's
@@ -361,10 +360,27 @@ final class AppModel {
                 self.liveIsFallback = !live
                 self.liveStatus = live ? nil : "Latest automatic reading. Live beats haven't arrived yet."
             }
-            let beats = try await session.liveHeartRate(keyHex: key, seconds: seconds, listener: listener)
+            var beats: UInt32
+            do {
+                beats = try await session.liveHeartRate(keyHex: key, seconds: seconds, listener: listener)
+            } catch let error as CoreError where Self.isRetryable(error) {
+                // The ring sometimes drops the link right as a new command starts.
+                DiagnosticsLog.shared.add("live HR: link dropped, reconnecting")
+                ble.disconnect()
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+                let again = try await ble.connect()
+                liveSession = again
+                beats = try await again.liveHeartRate(keyHex: key, seconds: seconds, listener: listener)
+            }
             DiagnosticsLog.shared.add("live HR ended: \(beats) live beats")
             if beats == 0 && liveHeartRate == nil {
-                liveError = "No heart-rate readings arrived. Make sure the ring is on your finger and snug, then try again."
+                if let last = latest(.heartRate) {
+                    let ago = RelativeDateTimeFormatter().localizedString(
+                        for: Date(timeIntervalSince1970: last.ts), relativeTo: .now)
+                    liveError = "The ring didn't stream live beats this time. Its last reading was \(Int(last.value.rounded())) bpm, \(ago)."
+                } else {
+                    liveError = "No heart-rate readings arrived. Make sure the ring is on your finger and snug, then try again."
+                }
             }
         } catch {
             DiagnosticsLog.shared.add("live HR failed: \(error.localizedDescription)")
@@ -378,6 +394,21 @@ final class AppModel {
     }
 
     /// Connect, retrying once after tearing down a possibly stale link.
+    /// Run one ring command, reconnecting once if the link drops under it. The ring
+    /// sometimes disconnects right as a new command starts on an existing link.
+    private func withRing<T>(_ op: (RingSession) async throws -> T) async throws -> T {
+        do {
+            return try await op(try await ble.connect())
+        } catch {
+            guard Self.isRetryable(error), !(error is CancellationError) else { throw error }
+            if let ble = error as? RingBluetooth.BLEError, case .bluetoothUnavailable = ble { throw error }
+            DiagnosticsLog.shared.add("ring command failed (\(error.localizedDescription)), reconnecting")
+            ble.disconnect()
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            return try await op(try await ble.connect())
+        }
+    }
+
     private func connectWithRetry() async throws -> RingSession {
         do {
             return try await ble.connect()
