@@ -5,6 +5,12 @@ struct SettingsView: View {
     @AppStorage("profile.weightKg") private var weightKg: Double = 75
     @AppStorage(Units.fahrenheitKey) private var fahrenheit = true
     @AppStorage(Units.poundsKey) private var pounds = true
+    @AppStorage(ExerciseAlerts.Key.enabled) private var exerciseOn = false
+    @AppStorage(ExerciseAlerts.Key.hr) private var exerciseHR = 120.0
+    @AppStorage(ExerciseAlerts.Key.met) private var exerciseMET = 5.0
+    @AppStorage(ExerciseAlerts.Key.hrOnly) private var exerciseHROnly = false
+    @AppStorage(ExerciseAlerts.Key.minutes) private var exerciseMinutes = 5
+    @AppStorage(ExerciseAlerts.Key.endNotice) private var exerciseEndNotice = true
     @State private var stats: StoreStats?
     @State private var counts: [EventTypeCount] = []
     @State private var exportURL: URL?
@@ -22,6 +28,39 @@ struct SettingsView: View {
                 Text("Sync")
             } footer: {
                 Text("Keeps Nocturne close to real time, also in the background. iOS reconnects to the ring every 5 minutes for a few seconds. Swiping Aurora away in the app switcher stops this until you open it again.")
+            }
+            Section {
+                Toggle("Exercise reminder", isOn: $exerciseOn)
+                    .onChange(of: exerciseOn) { _, on in
+                        guard on else { return }
+                        Task {
+                            if !(await ExerciseAlerts.requestPermission()) {
+                                notice = "Allow notifications for Aurora in iOS Settings so the reminder can appear."
+                            }
+                            // Lets the ring measure heart rate continuously during workouts.
+                            _ = try? await model.enableMeasurements()
+                        }
+                    }
+                if exerciseOn {
+                    Stepper(value: $exerciseHR, in: 80...200, step: 5) {
+                        LabeledContent("Heart rate at or above", value: "\(Int(exerciseHR)) bpm")
+                    }
+                    Toggle("Heart rate only (ignore movement)", isOn: $exerciseHROnly)
+                    if !exerciseHROnly {
+                        Stepper(value: $exerciseMET, in: 3...10, step: 0.5) {
+                            LabeledContent("Or movement at or above", value: String(format: "%.1f MET", exerciseMET))
+                        }
+                    }
+                    Stepper(value: $exerciseMinutes, in: 2...8) {
+                        LabeledContent("Active minutes needed", value: "\(exerciseMinutes) of last 8")
+                    }
+                    Toggle("Also tell me when it ends", isOn: $exerciseEndNotice)
+                    Button("Send a test notification") { ExerciseAlerts.sendTest() }
+                }
+            } header: {
+                Text("Exercise")
+            } footer: {
+                Text("After each sync (about every 5 minutes), Aurora checks the last 8 minutes and reminds you to set a temp target in Trio when you've been active for most of them. A flight of stairs won't count. It's only a reminder: nothing is changed in Trio. Your iPhone has to be within Bluetooth range of the ring, so keep it on the bench, not in the locker room. Each decision shows in Sync history.")
             }
             Section("Profile") {
                 if pounds {

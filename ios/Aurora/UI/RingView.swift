@@ -142,7 +142,7 @@ struct RingView: View {
                         }
                     }
                     .buttonStyle(.bordered)
-                    Button("Turn on HR + SpO2") {
+                    Button("Turn on all measurements") {
                         Task {
                             do {
                                 let warnings = try await model.enableMeasurements()

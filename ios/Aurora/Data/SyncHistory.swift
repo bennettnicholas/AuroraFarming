@@ -20,6 +20,8 @@ struct SyncRecord: Codable, Identifiable, Equatable {
     /// Nocturne's result for this sync, nil when Nocturne is off.
     var nocturne: String?
     var wasInBackground: Bool
+    /// The exercise detector's decision after this sync, when alerts are on.
+    var exercise: String? = nil
 }
 
 /// The last syncs, kept across launches, so you can check the background cadence.

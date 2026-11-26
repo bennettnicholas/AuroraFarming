@@ -153,7 +153,36 @@ pub struct EventTypeCount {
     pub decoded: u64,
 }
 
+/// What the exercise detector saw over a recent window. Per minute, a minute is
+/// "active" when its MET reaches `met_threshold` or a heart-rate reading within
+/// two minutes of it reaches `hr_threshold`.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct ExerciseCheck {
+    pub window_minutes: u32,
+    pub active_minutes: u32,
+    /// Highest heart rate in the window.
+    pub max_heart_rate: Option<f64>,
+    /// Mean MET over minutes that have MET data.
+    pub mean_met: Option<f64>,
+    /// Newest MET or heart-rate reading in the window (unix s); shows how fresh the
+    /// ring's data is, since activity data arrives in batches.
+    pub newest_data_ts: Option<f64>,
+}
+
 impl AuroraStore {
+    /// A heart-rate reading the ring reported directly (exercise HR at sync time).
+    /// Synthetic: keyed by its time so it never collides with event-derived samples.
+    pub(crate) fn record_ring_heart_rate(&self, bpm: u16) -> Result<(), CoreError> {
+        let inner = self.lock();
+        let now = now_unix();
+        inner.conn.execute(
+            "INSERT OR IGNORE INTO samples (kind, ts, end_ts, value, event_id, ord)
+             VALUES (?1, ?2, NULL, ?3, -1, ?4)",
+            params![MetricKind::HeartRate.id(), now as f64, bpm as f64, now],
+        )?;
+        Ok(())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A panic while holding the lock would poison it; the data is still a valid
         // SQLite handle, so keep going rather than bricking the app.
@@ -384,6 +413,62 @@ impl Inner {
 
 #[uniffi::export]
 impl AuroraStore {
+    /// Count active minutes in the `window_minutes` before `now` (see [`ExerciseCheck`]).
+    pub fn exercise_check(
+        &self,
+        now: f64,
+        window_minutes: u32,
+        hr_threshold: f64,
+        met_threshold: f64,
+    ) -> Result<ExerciseCheck, CoreError> {
+        let from = now - window_minutes as f64 * 60.0;
+        let inner = self.lock();
+        let read = |kind: MetricKind, from: f64| -> rusqlite::Result<Vec<(f64, f64)>> {
+            let mut stmt = inner.conn.prepare_cached(
+                "SELECT ts, value FROM samples WHERE kind = ?1 AND ts >= ?2 AND ts <= ?3 ORDER BY ts",
+            )?;
+            let rows = stmt
+                .query_map(params![kind.id(), from, now], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect();
+            rows
+        };
+        let met = read(MetricKind::ActivityMet, from)?;
+        // Heart rate a little before the window can still mark its first minutes.
+        let hr = read(MetricKind::HeartRate, from - 120.0)?;
+        drop(inner);
+
+        let n = window_minutes as usize;
+        let minute = |ts: f64| ((ts - from) / 60.0).floor();
+        let mut active = vec![false; n];
+        for &(ts, v) in &met {
+            let m = minute(ts);
+            if v >= met_threshold && m >= 0.0 && (m as usize) < n {
+                active[m as usize] = true;
+            }
+        }
+        for &(ts, v) in &hr {
+            if v < hr_threshold {
+                continue;
+            }
+            let m = minute(ts) as i64;
+            for k in (m - 2)..=(m + 2) {
+                if k >= 0 && (k as usize) < n {
+                    active[k as usize] = true;
+                }
+            }
+        }
+        let max_heart_rate = hr.iter().filter(|(ts, _)| *ts >= from).map(|(_, v)| *v).reduce(f64::max);
+        let mean_met = (!met.is_empty()).then(|| met.iter().map(|(_, v)| v).sum::<f64>() / met.len() as f64);
+        let newest_data_ts = met.iter().chain(hr.iter()).map(|(ts, _)| *ts).reduce(f64::max);
+        Ok(ExerciseCheck {
+            window_minutes,
+            active_minutes: active.iter().filter(|a| **a).count() as u32,
+            max_heart_rate,
+            mean_met,
+            newest_data_ts,
+        })
+    }
+
     /// Open (or create) the database at `path`.
     #[uniffi::constructor]
     pub fn open(path: String) -> Result<std::sync::Arc<Self>, CoreError> {
@@ -846,5 +931,35 @@ mod tests {
             .unwrap();
         assert_eq!(b.len(), 3); // 03:55, 04:00 and 08:00
         assert_eq!(b[0].min, 50.0);
+    }
+
+    #[test]
+    fn exercise_check_counts_active_minutes() {
+        let (_dir, store) = temp_db();
+        let now = 1_800_000_000.0;
+        {
+            let inner = store.lock();
+            let mut add = |kind: MetricKind, ts: f64, v: f64, ord: i64| {
+                inner.conn.execute(
+                    "INSERT INTO samples (kind, ts, end_ts, value, event_id, ord) VALUES (?1, ?2, NULL, ?3, -2, ?4)",
+                    params![kind.id(), ts, v, ord],
+                ).unwrap();
+            };
+            // Stairs: two minutes of MET 6 eight minutes ago; walking MET 3 otherwise.
+            for m in 0..8 {
+                let met = if m == 0 || m == 1 { 6.0 } else { 3.0 };
+                add(MetricKind::ActivityMet, now - 480.0 + m as f64 * 60.0 + 30.0, met, m);
+            }
+            // Hockey: one HR of 150 at minute 6 marks minutes 4..7 (clamped).
+            add(MetricKind::HeartRate, now - 120.0 + 10.0, 150.0, 100);
+        }
+        let c = store.exercise_check(now, 8, 130.0, 5.0).unwrap();
+        assert_eq!(c.window_minutes, 8);
+        // MET marks minutes 0 and 1; HR at minute 6 marks 4, 5, 6, 7.
+        assert_eq!(c.active_minutes, 6);
+        assert_eq!(c.max_heart_rate, Some(150.0));
+        // HR alone (no motion requirement) can make a window active.
+        let c = store.exercise_check(now, 8, 130.0, 99.0).unwrap();
+        assert_eq!(c.active_minutes, 4);
     }
 }

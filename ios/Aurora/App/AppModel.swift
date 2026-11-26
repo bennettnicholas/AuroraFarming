@@ -28,6 +28,7 @@ final class AppModel {
     let store: AuroraStore
     let connectors: ConnectorManager
     let history = SyncHistory()
+    let exercise = ExerciseAlerts()
     private let ble = RingBluetooth()
     private let log = Logger(subsystem: "Aurora", category: "App")
 
@@ -137,10 +138,12 @@ final class AppModel {
             }
             syncPhase = .connecting
             do {
-                let newEvents = try await syncOnce(key: key)
+                let report = try await syncOnce(key: key)
+                let newEvents = report.newEvents
                 history.add(SyncRecord(date: .now, trigger: trigger, ok: true,
                                        detail: newEvents == 1 ? "1 new event" : "\(newEvents) new events",
-                                       nocturne: nocturneResult(), wasInBackground: background))
+                                       nocturne: nocturneResult(), wasInBackground: background,
+                                       exercise: exercise.evaluate(store: store, report: report)))
                 return
             } catch {
                 lastError = error
@@ -183,7 +186,7 @@ final class AppModel {
     }
 
     @discardableResult
-    private func syncOnce(key: String) async throws -> UInt32 {
+    private func syncOnce(key: String) async throws -> SyncReport {
         DiagnosticsLog.shared.add("sync: connecting")
         let session = try await ble.connect()
         if ringInfo == nil { ringInfo = try? await session.info() }
@@ -207,7 +210,7 @@ final class AppModel {
         syncPhase = .finished(report)
         DiagnosticsLog.shared.add("sync ok: \(report.eventsReceived) events, \(report.newEvents) new, warnings \(report.warnings)")
         await connectors.exportAll()
-        return report.newEvents
+        return report
     }
 
     // MARK: - Continuous (5-minute) sync

@@ -92,6 +92,10 @@ pub struct SyncReport {
     /// Samples written or re-dated.
     pub samples_written: u32,
     pub battery_percent: Option<u8>,
+    /// The ring's own exercise-HR feature is measuring right now (it detected a workout).
+    pub exercise_measuring: bool,
+    /// Exercise heart rate the ring reported at sync time, if any.
+    pub exercise_heart_rate: Option<u16>,
     pub next_cursor: u32,
     /// Non-fatal problems (e.g. the clock could not be aligned).
     pub warnings: Vec<String>,
@@ -133,6 +137,18 @@ pub(crate) fn parse_pushed_latest_hr(p: &Packet) -> Option<(u16, u16)> {
     }
     let ibi = u16::from_le_bytes([p.payload[7], p.payload[8]]);
     (300..=2000).contains(&ibi).then(|| (60_000 / ibi, ibi))
+}
+
+pub(crate) fn parse_exercise_latest(payload: &[u8]) -> (bool, Option<u16>) {
+    if payload.len() < 5 || payload[2] != 0 {
+        return (false, None);
+    }
+    let measuring = payload[4] == 2;
+    let bpm = payload
+        .get(11)
+        .map(|&b| b as u16)
+        .filter(|b| (40..=220).contains(b));
+    (measuring, if measuring { bpm } else { None })
 }
 
 /// The result byte of an ext response (`[0]=ext [1]=id [2]=result`).
@@ -289,6 +305,25 @@ impl RingSession {
         false
     }
 
+    /// Exercise-HR latest values: `[0]=0x25 [1]=feature [2]=result [3]=status
+    /// [4]=state [5..7]=counter [7..]=data`, data[4] = last HR (bpm). State 2 means
+    /// the feature is measuring.
+    async fn exercise_latest(&self) -> (bool, Option<u16>) {
+        let Ok(packets) = self
+            .ext_request(&protocol::req_feature_latest(feature::EXERCISE_HR), 0x25)
+            .await
+        else {
+            return (false, None);
+        };
+        let Some(p) = packets
+            .iter()
+            .find(|p| p.ext_tag() == Some(0x25) && p.payload.get(1) == Some(&feature::EXERCISE_HR))
+        else {
+            return (false, None);
+        };
+        parse_exercise_latest(&p.payload)
+    }
+
     async fn info_inner(&self) -> Result<RingInfo, CoreError> {
         let fw = self.client.firmware().await?;
         let serial = self.client.serial().await.unwrap_or_default();
@@ -307,7 +342,14 @@ impl RingSession {
 
     async fn enable_measurements_inner(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-        for (label, id) in [("heart rate", feature::DAYTIME_HR), ("SpO2", feature::SPO2)] {
+        // REAL_STEPS before EXERCISE_HR: the Oura app's automatic-workout-HR setup
+        // enables it first as a prerequisite (open_oura docs/ring-features.md).
+        for (label, id) in [
+            ("heart rate", feature::DAYTIME_HR),
+            ("SpO2", feature::SPO2),
+            ("steps", 0x0b), // REAL_STEPS (feature and capability ids match)
+            ("exercise heart rate", feature::EXERCISE_HR),
+        ] {
             if let Err(e) = self.client.set_feature_mode(id, feature_mode::AUTOMATIC).await {
                 warnings.push(format!("Could not enable {label}: {e}"));
             }
@@ -546,6 +588,13 @@ impl RingSession {
             store.record_battery(&serial, b.percent)?;
         }
 
+        // Exercise HR right now: the ring measures it continuously once it decides a
+        // workout started, and reports it directly as bpm. Kept as a heart-rate sample.
+        let (exercise_measuring, exercise_heart_rate) = self.exercise_latest().await;
+        if let Some(bpm) = exercise_heart_rate {
+            store.record_ring_heart_rate(bpm)?;
+        }
+
         listener.on_stage(SyncStage::Downloading);
         let cursor = store.with_raw(|raw| raw.cursor(&serial))?;
         // std Mutex (not RefCell) so the drain future stays Send.
@@ -590,6 +639,8 @@ impl RingSession {
             new_events: inserted.into_inner().unwrap(),
             samples_written,
             battery_percent: battery.map(|b| b.percent),
+            exercise_measuring,
+            exercise_heart_rate,
             next_cursor: outcome.next_cursor,
             warnings,
         })
@@ -629,6 +680,19 @@ mod tests {
         assert_eq!(s.key_status(KEY.into()).await.unwrap(), KeyStatus::Accepted);
         let nonce_requests = ring.writes.lock().unwrap().iter().filter(|w| *w == "2f012b").count();
         assert_eq!(nonce_requests, 3);
+    }
+
+    #[test]
+    fn exercise_latest_parses_state_and_bpm() {
+        // Ring 3 capture with result NOT_AVAILABLE: nothing.
+        let p = hex::decode("250302000000000510001d0000ab1b").unwrap();
+        assert_eq!(parse_exercise_latest(&p), (false, None));
+        // Measuring, last HR 0x8c = 140 bpm at data[4].
+        let p = hex::decode("25030001020000000000008c").unwrap();
+        assert_eq!(parse_exercise_latest(&p), (true, Some(140)));
+        // Idle: a stale bpm is ignored.
+        let p = hex::decode("25030001000000000000008c").unwrap();
+        assert_eq!(parse_exercise_latest(&p), (false, None));
     }
 
     #[test]

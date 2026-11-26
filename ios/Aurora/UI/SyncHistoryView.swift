@@ -49,6 +49,9 @@ struct SyncHistoryView: View {
                         }
                         Text("\(r.trigger.rawValue) · \(r.detail)")
                             .font(.caption).foregroundStyle(.secondary)
+                        if let e = r.exercise {
+                            Text(e).font(.caption).foregroundStyle(e.contains("started") ? Theme.rose : .secondary)
+                        }
                         if let n = r.nocturne {
                             Text(n).font(.caption).foregroundStyle(n.contains("failed") ? Theme.amber : .secondary)
                         }
