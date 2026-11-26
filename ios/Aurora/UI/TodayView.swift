@@ -132,7 +132,9 @@ private struct NightVitalsCard: View {
                     MetricTile(kind: .hrv, value: summary?.averageHrv, title: "HRV")
                     MetricTile(kind: .skinTemperature, value: summary?.temperatureDeviation ?? summary?.skinTemperature,
                                title: summary?.temperatureDeviation != nil ? "Temp. deviation" : "Skin temp.",
-                               formatted: summary?.temperatureDeviation.map { String(format: "%+.2f", $0) })
+                               formatted: summary?.temperatureDeviation.map {
+                                   String(format: Units.fahrenheit ? "%+.1f" : "%+.2f", MetricKind.skinTemperature.displayDelta($0))
+                               })
                     MetricTile(kind: .respiratoryRate, value: summary?.respiratoryRate, title: "Breathing")
                     MetricTile(kind: .spo2, value: summary?.averageSpo2, title: "Blood oxygen")
                     MetricTile(kind: .battery, value: summary?.latestBattery, title: "Ring battery")

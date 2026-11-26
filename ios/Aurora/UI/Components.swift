@@ -31,6 +31,7 @@ struct MetricTile: View {
     var title: String? = nil
     var caption: String? = nil
     var formatted: String? = nil
+    @AppStorage(Units.fahrenheitKey) private var fahrenheit = true // re-render on unit change
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -61,6 +62,7 @@ struct BucketChart: View {
     let buckets: [Bucket]
     var bucketSeconds: TimeInterval = 3600
     var height: CGFloat = 160
+    @AppStorage(Units.fahrenheitKey) private var fahrenheit = true // re-render on unit change
 
     var body: some View {
         if buckets.isEmpty {
@@ -74,18 +76,18 @@ struct BucketChart: View {
                 if b.max > b.min {
                     RectangleMark(
                         x: .value("Time", mid),
-                        yStart: .value("Min", b.min),
-                        yEnd: .value("Max", b.max),
+                        yStart: .value("Min", kind.display(b.min)),
+                        yEnd: .value("Max", kind.display(b.max)),
                         width: .ratio(0.55)
                     )
                     .foregroundStyle(kind.tint.opacity(0.25))
                     .cornerRadius(4)
                 }
-                LineMark(x: .value("Time", mid), y: .value(kind.title, b.mean))
+                LineMark(x: .value("Time", mid), y: .value(kind.title, kind.display(b.mean)))
                     .foregroundStyle(kind.tint)
                     .interpolationMethod(.catmullRom)
                     .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                PointMark(x: .value("Time", mid), y: .value(kind.title, b.mean))
+                PointMark(x: .value("Time", mid), y: .value(kind.title, kind.display(b.mean)))
                     .foregroundStyle(kind.tint)
                     .symbolSize(18)
             }
@@ -189,6 +191,7 @@ struct SampleChart: View {
     var gapSeconds: TimeInterval = 30 * 60
 
     @State private var selected: Date?
+    @AppStorage(Units.fahrenheitKey) private var fahrenheit = true // re-render on unit change
 
     private struct Point: Identifiable {
         let id: Int64
@@ -221,11 +224,11 @@ struct SampleChart: View {
             let pick = selected.flatMap { nearest(to: $0, in: points) }
             Chart {
                 ForEach(points) { p in
-                    LineMark(x: .value("Time", p.date), y: .value(kind.title, p.value),
+                    LineMark(x: .value("Time", p.date), y: .value(kind.title, kind.display(p.value)),
                              series: .value("Stretch", p.segment))
                         .foregroundStyle(kind.tint.opacity(0.45))
                         .lineStyle(StrokeStyle(lineWidth: 1))
-                    PointMark(x: .value("Time", p.date), y: .value(kind.title, p.value))
+                    PointMark(x: .value("Time", p.date), y: .value(kind.title, kind.display(p.value)))
                         .foregroundStyle(kind.tint)
                         .symbolSize(points.count > 1500 ? 4 : 10)
                 }
@@ -241,7 +244,7 @@ struct SampleChart: View {
                             .padding(.horizontal, 8).padding(.vertical, 4)
                             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
                         }
-                    PointMark(x: .value("Time", pick.date), y: .value(kind.title, pick.value))
+                    PointMark(x: .value("Time", pick.date), y: .value(kind.title, kind.display(pick.value)))
                         .foregroundStyle(.white)
                         .symbolSize(40)
                 }

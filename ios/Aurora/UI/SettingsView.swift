@@ -3,6 +3,8 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @AppStorage("profile.weightKg") private var weightKg: Double = 75
+    @AppStorage(Units.fahrenheitKey) private var fahrenheit = true
+    @AppStorage(Units.poundsKey) private var pounds = true
     @State private var stats: StoreStats?
     @State private var counts: [EventTypeCount] = []
     @State private var exportURL: URL?
@@ -21,8 +23,25 @@ struct SettingsView: View {
                 Text("Keeps Nocturne close to real time, also in the background. iOS reconnects to the ring every 5 minutes for a few seconds. Swiping Aurora away in the app switcher stops this until you open it again.")
             }
             Section("Profile") {
-                Stepper(value: $weightKg, in: 30...200, step: 1) {
-                    LabeledContent("Weight", value: "\(Int(weightKg)) kg")
+                if pounds {
+                    // Stored in kg; stepped in whole pounds.
+                    Stepper(value: Binding(get: { (weightKg / Units.kgPerPound).rounded() },
+                                           set: { weightKg = $0 * Units.kgPerPound }),
+                            in: 66...440, step: 1) {
+                        LabeledContent("Weight", value: "\(Int((weightKg / Units.kgPerPound).rounded())) lb")
+                    }
+                } else {
+                    Stepper(value: $weightKg, in: 30...200, step: 1) {
+                        LabeledContent("Weight", value: "\(Int(weightKg.rounded())) kg")
+                    }
+                }
+                Picker("Temperature", selection: $fahrenheit) {
+                    Text("°F").tag(true)
+                    Text("°C").tag(false)
+                }
+                Picker("Weight unit", selection: $pounds) {
+                    Text("lb").tag(true)
+                    Text("kg").tag(false)
                 }
             }
             Section {

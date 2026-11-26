@@ -60,6 +60,7 @@ private struct TrendCard: View {
     let kind: MetricKind
     let buckets: [Bucket]
     let bucketSeconds: TimeInterval
+    @AppStorage(Units.fahrenheitKey) private var fahrenheit = true // re-render on unit change
 
     var body: some View {
         Card {
@@ -134,7 +135,7 @@ struct MetricDetailView: View {
         switch kind {
         case .heartRate: "5-minute averages from the ring's HRV records plus quality-gated beat-to-beat readings (Ring 5 green-LED stream)."
         case .hrv: "RMSSD, averaged over 5 minutes by the ring. Most meaningful during sleep."
-        case .skinTemperature: "The ring's nocturnal skin-temperature stream. Look at changes from your own baseline, not absolute values."
+        case .skinTemperature: "Skin temperature from the ring, day and night. Look at changes from your own baseline, not absolute values."
         case .spo2: "Blood-oxygen readings the ring takes automatically, mostly at night."
         case .respiratoryRate: "Breaths per minute from the ring's sleep windows."
         case .activityMet: "Metabolic equivalent per minute: 1 is resting, 3+ is brisk walking, 7+ is running."
