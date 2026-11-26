@@ -66,7 +66,7 @@ private struct ConnectorRow: View {
                 Text(connector.tagline).font(.caption).foregroundStyle(.secondary)
                 if let status {
                     Text(status.error.map { "Error: \($0)" }
-                         ?? "Sent \(status.exported) readings \(status.lastRun.formatted(.relative(presentation: .named)))")
+                         ?? "Sent \(status.exported) readings \(agoText(status.lastRun))")
                         .font(.caption2)
                         .foregroundStyle(status.error == nil ? Color.secondary : Theme.amber)
                 }

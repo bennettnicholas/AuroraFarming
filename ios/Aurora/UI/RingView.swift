@@ -42,7 +42,7 @@ struct RingView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(model.ringInfo.map { $0.isRing5 ? "Oura Ring 5" : "Oura Ring" } ?? "Oura Ring")
                             .font(.title3.weight(.semibold))
-                        Text(linkText).font(.caption).foregroundStyle(.secondary)
+                        TimelineView(.periodic(from: .now, by: 30)) { _ in Text(linkText).font(.caption).foregroundStyle(.secondary) }
                         if let d = model.device {
                             Text("Firmware \(d.firmware) · \(d.hardwareId)").font(.caption).foregroundStyle(.secondary)
                         }
@@ -68,7 +68,7 @@ struct RingView: View {
         case .poweredOff: "Bluetooth is off"
         case .unauthorized: "Bluetooth permission needed"
         case .unsupported: "Bluetooth unsupported"
-        case .idle: model.lastSync.map { "Last synced \($0.formatted(.relative(presentation: .named)))" } ?? "Not synced yet"
+        case .idle: model.lastSync.map { "Last synced \(agoText($0))" } ?? "Not synced yet"
         }
     }
 

@@ -35,7 +35,10 @@ struct SyncPill: View {
                 } else {
                     Image(systemName: icon)
                 }
-                Text(text).lineLimit(1)
+                // Re-render every 30 s so "4 min ago" keeps counting.
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    Text(text(now: context.date)).lineLimit(1)
+                }
             }
             .font(.footnote.weight(.medium))
             .padding(.horizontal, 12)
@@ -51,7 +54,7 @@ struct SyncPill: View {
         return "arrow.triangle.2.circlepath"
     }
 
-    private var text: String {
+    private func text(now: Date) -> String {
         switch model.syncPhase {
         case .connecting: return "Looking for your ring…"
         case .running(let stage, let events, let left):
@@ -68,7 +71,7 @@ struct SyncPill: View {
         case .failed: return "Sync failed · tap to retry"
         case .finished, .idle:
             if let last = model.lastSync {
-                return "Synced \(last.formatted(.relative(presentation: .named)))"
+                return "Synced \(agoText(last, now: now))"
             }
             return "Sync now"
         }
