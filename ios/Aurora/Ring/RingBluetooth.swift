@@ -58,6 +58,10 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
 
     private var poweredOnWaiters: [CheckedContinuation<Void, Error>] = []
     private var connectContinuation: CheckedContinuation<RingSession, Error>?
+    /// When the current session became ready; a fresh one (from a scheduled wake) is reused.
+    private var sessionReadyAt: Date?
+    /// A delayed connect is armed and has not produced a ready session yet.
+    private var wakePending = false
 
     /// Called on the main actor whenever the link state changes.
     var onStateChange: (@MainActor (State) -> Void)?
@@ -72,7 +76,51 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
 
     override init() {
         super.init()
-        central = CBCentralManager(delegate: self, queue: queue)
+        // State restoration: if iOS terminates Aurora while a (delayed) connection is
+        // pending, it relaunches the app in the background when that connection completes.
+        central = CBCentralManager(delegate: self, queue: queue, options: [
+            CBCentralManagerOptionRestoreIdentifierKey: "com.aurorafarming.aurora.central",
+        ])
+    }
+
+    /// Called on the main actor when the ring connects without anyone waiting for
+    /// it, i.e. a scheduled wake fired (possibly after iOS relaunched the app).
+    var onUnsolicitedConnect: (@MainActor () -> Void)?
+
+    /// Drop the current link and ask iOS to reconnect to the ring in `seconds`.
+    ///
+    /// This is the 5-minute cadence. It uses `CBConnectPeripheralOptionStartDelayKey`
+    /// (iOS 17): the delay is kept by the Bluetooth system, not by an app timer, so it
+    /// runs while Aurora is suspended, and with state restoration even after iOS has
+    /// terminated it. When the connection completes, iOS wakes the app and
+    /// ``onUnsolicitedConnect`` fires.
+    func scheduleWake(after seconds: TimeInterval) {
+        queue.async {
+            guard self.connectContinuation == nil else { return } // a connect is in progress
+            guard let id = self.rememberedPeripheral,
+                  let p = self.central.retrievePeripherals(withIdentifiers: [id]).first else { return }
+            if let current = self.peripheral, current.state != .disconnected {
+                self.central.cancelPeripheralConnection(current)
+            }
+            self.reset()
+            self.peripheral = p
+            p.delegate = self
+            self.central.connect(p, options: [CBConnectPeripheralOptionStartDelayKey: max(1, Int(seconds))])
+            self.wakePending = true
+            self.diag.add("wake scheduled in \(Int(seconds)) s")
+            self.state = .idle
+        }
+    }
+
+    /// Cancel a scheduled wake (continuous sync turned off, ring forgotten).
+    func cancelWake() {
+        queue.async {
+            guard self.connectContinuation == nil, let p = self.peripheral, self.session == nil else { return }
+            self.wakePending = false
+            self.central.cancelPeripheralConnection(p)
+            self.reset()
+            self.diag.add("wake cancelled")
+        }
     }
 
     var rememberedPeripheral: UUID? {
@@ -152,6 +200,15 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
             previous.resume(throwing: CancellationError())
         }
         connectContinuation = cont
+        // A scheduled wake just brought the ring up: use that link instead of tearing it down.
+        if let s = session, let p = peripheral, p.state == .connected, writeCharacteristic != nil,
+           let readyAt = sessionReadyAt, Date.now.timeIntervalSince(readyAt) < 60 {
+            diag.add("connect: reusing link from scheduled wake")
+            connectContinuation = nil
+            cont.resume(returning: s)
+            return
+        }
+        wakePending = false
         diag.add("connect: start (remembered=\(rememberedPeripheral?.uuidString ?? "none"))")
         // Drop any half-open link first: a peripheral iOS still calls "connected"
         // after the ring silently went away makes every request time out.
@@ -193,6 +250,7 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
 
     private func reset() {
         session = nil
+        sessionReadyAt = nil
         writeCharacteristic = nil
         pendingNotifySubscriptions = 0
         peripheral = nil
@@ -216,12 +274,19 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
         let link = Link(owner: self)
         let s = RingSession(link: link)
         session = s
+        sessionReadyAt = .now
+        wakePending = false
         UserDefaults.standard.set(p.identifier.uuidString, forKey: Self.rememberedKey)
         state = .connected(name: p.name ?? "Oura Ring")
         log.info("ring ready: \(p.name ?? "?", privacy: .public)")
         diag.add("ring ready: \(p.name ?? "?") \(p.identifier.uuidString)")
-        connectContinuation?.resume(returning: s)
-        connectContinuation = nil
+        if let cont = connectContinuation {
+            cont.resume(returning: s)
+            connectContinuation = nil
+        } else if let cb = onUnsolicitedConnect {
+            diag.add("scheduled wake: ring connected")
+            Task { @MainActor in cb() }
+        }
     }
 
     /// Called by the Rust core (any thread) to send a request frame.
@@ -247,6 +312,17 @@ final class RingBluetooth: NSObject, @unchecked Sendable {
 }
 
 extension RingBluetooth: CBCentralManagerDelegate {
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        let restored = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        diag.add("restored by iOS with \(restored.count) peripheral(s)")
+        guard let p = restored.first else { return }
+        peripheral = p
+        p.delegate = self
+        if p.state == .connected {
+            p.discoverServices([Self.serviceUUID])
+        }
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
@@ -311,6 +387,13 @@ extension RingBluetooth: CBCentralManagerDelegate {
         guard peripheral.identifier == self.peripheral?.identifier else { return }
         if connectContinuation != nil {
             fail(BLEError.disconnected(error?.localizedDescription))
+        } else if wakePending {
+            // The ring dropped during a scheduled wake before it was ready: re-arm it.
+            reset()
+            self.peripheral = peripheral
+            central.connect(peripheral, options: [CBConnectPeripheralOptionStartDelayKey: 30])
+            diag.add("wake re-armed in 30 s")
+            state = .idle
         } else {
             reset()
             state = .idle

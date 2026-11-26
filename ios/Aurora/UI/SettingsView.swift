@@ -11,6 +11,15 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                Toggle("Sync every 5 minutes", isOn: Binding(
+                    get: { model.continuousSync },
+                    set: { model.continuousSync = $0 }))
+            } header: {
+                Text("Sync")
+            } footer: {
+                Text("Keeps Nocturne close to real time, also in the background. iOS reconnects to the ring every 5 minutes for a few seconds. Swiping Aurora away in the app switcher stops this until you open it again.")
+            }
             Section("Profile") {
                 Stepper(value: $weightKg, in: 30...200, step: 1) {
                     LabeledContent("Weight", value: "\(Int(weightKg)) kg")

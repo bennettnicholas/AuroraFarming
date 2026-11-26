@@ -1,5 +1,6 @@
 import BackgroundTasks
 import Foundation
+import UIKit
 import Observation
 import os
 
@@ -68,6 +69,9 @@ final class AppModel {
         connectors = ConnectorManager(store: store)
         device = try? store.device()
         ble.onStateChange = { [weak self] state in self?.linkState = state }
+        ble.onUnsolicitedConnect = { [weak self] in
+            Task { await self?.handleScheduledWake() }
+        }
     }
 
     // MARK: - Day navigation
@@ -181,6 +185,56 @@ final class AppModel {
         await connectors.exportAll()
     }
 
+    // MARK: - Continuous (5-minute) sync
+
+    static let continuousInterval: TimeInterval = 5 * 60
+
+    /// Sync about every five minutes, also in the background. On by default.
+    var continuousSync: Bool = UserDefaults.standard.object(forKey: "sync.continuous") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(continuousSync, forKey: "sync.continuous")
+            if continuousSync { scheduleNextWake() } else { ble.cancelWake() }
+        }
+    }
+
+    private var foregroundTimer: Timer?
+    private(set) var isInForeground = true
+
+    /// The app went to the background: hand the cadence to the Bluetooth system.
+    func didEnterBackground() {
+        isInForeground = false
+        foregroundTimer?.invalidate()
+        foregroundTimer = nil
+        if continuousSync, hasKey, !isStreamingHeartRate { scheduleNextWake() }
+    }
+
+    func didBecomeActive() {
+        isInForeground = true
+        foregroundTimer?.invalidate()
+        foregroundTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.continuousSync, !self.isStreamingHeartRate else { return }
+                await self.syncIfStale(minimumInterval: Self.continuousInterval - 15)
+            }
+        }
+        Task { await syncIfStale(minimumInterval: continuousSync ? Self.continuousInterval - 15 : 15 * 60) }
+    }
+
+    private func scheduleNextWake() {
+        let since = lastSync.map { Date.now.timeIntervalSince($0) } ?? Self.continuousInterval
+        ble.scheduleWake(after: max(5, Self.continuousInterval - since))
+    }
+
+    /// The delayed connection fired: sync, then schedule the next one. iOS gives a
+    /// woken background app only seconds, so ask for the extended background window.
+    func handleScheduledWake() async {
+        let task = UIApplication.shared.beginBackgroundTask(withName: "aurora.sync")
+        defer { if task != .invalid { UIApplication.shared.endBackgroundTask(task) } }
+        DiagnosticsLog.shared.add("scheduled wake: syncing (foreground=\(isInForeground))")
+        await syncNow(userInitiated: false)
+        if !isInForeground && continuousSync { scheduleNextWake() }
+    }
+
     // MARK: - Pairing
 
     enum RingCheck: Equatable {
@@ -244,6 +298,7 @@ final class AppModel {
     }
 
     func forgetRing() {
+        ble.cancelWake()
         Keychain.delete(Keychain.ringKeyAccount)
         hasKey = false
         ringInfo = nil

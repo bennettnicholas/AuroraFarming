@@ -22,8 +22,9 @@ struct AuroraApp: App {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
-                Task { await model.syncIfStale() }
+                model.didBecomeActive()
             case .background:
+                model.didEnterBackground()
                 AppModel.scheduleBackgroundSync()
             default:
                 break
